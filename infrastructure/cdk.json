@@ -1,0 +1,26 @@
+{
+  "app": "python3 cdk/app.py",
+  "context": {
+    "tags": {
+      "Owner": "san99tiago",
+      "Source": "aws-agentcore-fine-grained-access-bank-demo",
+      "Usage": "santi-bank AgentCore Gateway Fine-Grained Access Control demo with Cognito JWT and DynamoDB"
+    },
+    "app_config": {
+      "dev": {
+        "main_resources_name": "santi-bank",
+        "deployment_environment": "dev",
+        "log_level": "DEBUG",
+        "users_table_name": "santi-bank-users-data",
+        "channels_table_name": "santi-bank-channels-data",
+        "fine_grained_access_table_name": "santi-bank-fine-grained-access-mapping",
+        "hosted_zone_name": "cb.events.genai.aws.dev",
+        "hosted_zone_id": "Z0422199173AVFEWSD3SF",
+        "custom_domain_subdomain": "santi-bank-fine-access",
+        "cognito_users": ["santi", "jimmy", "joacho"],
+        "gateway_exception_level": "DEBUG",
+        "interceptor_deny_mode": "mcp_error"
+      }
+    }
+  }
+}
