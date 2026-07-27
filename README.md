@@ -6,6 +6,7 @@ Replica **end-to-end** del escenario del cliente **"santi-bank"** para validar *
 - **Amazon DynamoDB** como *data store* dinámico de permisos (usuario → tool → allowed).
 - **Amazon Cognito (JWT)** como *Inbound Auth* (CUSTOM_JWT authorizer).
 - **Custom Domain** con Route53 + ACM + CloudFront.
+- **Origin Cloaking** 🧱: **AWS WAF asociado directamente al Gateway** + secreto en **Secrets Manager** inyectado por CloudFront como header — el Gateway SOLO acepta tráfico que venga de CloudFront.
 - **100% Infraestructura como Código** con **AWS CDK (Python)** + Poetry.
 
 > Basado en la documentación oficial de AWS Labs:
@@ -43,6 +44,7 @@ El equipo del cliente tenía la validación AuthN/AuthZ **solo en el interceptor
 |---|---|---|---|
 | 1 | La validación debe ocurrir en **ListTools** (Interceptor RESPONSE) **Y** en **InvokeTool** (Interceptor REQUEST) | ✅ | Un solo Lambda FGAC conectado a los 2 puntos de intercepción. El REQUEST interceptor hace **short-circuit** de invocaciones no autorizadas (el target NUNCA se invoca) |
 | 2 | Los errores del Gateway son genéricos: "StatusCode ≠ 200 da SIEMPRE el mismo mensaje" (incluso con tokens vacíos) | ✅ | `ExceptionLevel: DEBUG` en el Gateway + patrón de DENY con **HTTP 200 + `isError: true`** para que el mensaje rico llegue al cliente MCP |
+| 3 | *(Follow-up)* ¿Es posible que el Gateway SOLO acepte peticiones desde CloudFront? | ✅ | **Origin cloaking**: WAF regional asociado DIRECTAMENTE al AgentCore Gateway (default BLOCK) + header secreto `X-Origin-Verify` (Secrets Manager) inyectado por CloudFront — ver [sección 7.3](#73--origin-cloaking-el-gateway-solo-acepta-tráfico-de-cloudfront-waf--secrets-manager) |
 
 **¿Y la validación de headers custom?** ❌ **NO**. Headers como `X-Client-ID` son fácilmente falsificables. El ÚNICO origen de identidad confiable es el **JWT firmado**, cuya firma valida el Gateway (Inbound Auth) ANTES de invocar cualquier interceptor. El interceptor recibe el header `Authorization` gracias a `passRequestHeaders: true` y solo decodifica el payload (la firma ya está garantizada).
 
@@ -67,7 +69,10 @@ flowchart TB
         COG["Cognito User Pool<br/>santi-bank-user-pool-dev<br/>SIN auto-registro<br/>App Client con USER_PASSWORD_AUTH"]
     end
 
+    SM["🔑 Secrets Manager<br/>santi-bank-origin-verify-dev<br/>valor: santi-aws"]
+
     subgraph GW["⚡ AgentCore Gateway MCP :: santi-bank-gateway-dev"]
+        WAF["🧱 AWS WAF regional - asociado al Gateway<br/>default: BLOCK 403<br/>ALLOW solo si header<br/>x-origin-verify == secreto"]
         JWT["CUSTOM_JWT Authorizer<br/>valida firma + allowedClients<br/>ExceptionLevel: DEBUG"]
         REQINT["🛡️ REQUEST Interceptor - Lambda FGAC<br/>Bloquea tools/call NO permitidos<br/>short-circuit con mensaje claro"]
         RESINT["🛡️ RESPONSE Interceptor - Lambda FGAC<br/>Filtra tools/list por usuario"]
@@ -90,7 +95,11 @@ flowchart TB
         CR["Lambda santi-bank-setup-users-dev<br/>CREATE/UPDATE:<br/>1. Crea users Cognito - Testing123.<br/>2. Puebla las 3 tablas DynamoDB"]
     end
 
-    CLIENT -->|"HTTPS + Bearer JWT"| R53 --> CF -->|"origen HTTPS"| JWT
+    CLIENT -->|"HTTPS + Bearer JWT"| R53 --> CF -->|"origen HTTPS +<br/>header X-Origin-Verify"| WAF
+    WAF -->|"✅ header valido"| JWT
+    CLIENT -.->|"🚫 invocacion DIRECTA al Gateway URL<br/>SIN header X-Origin-Verify -> BLOCK 403"| WAF
+    SM -.->|"secreto como<br/>origin custom header"| CF
+    SM -.->|"secreto como<br/>search string de la regla"| WAF
     CLIENT -.->|"1. token via USER_PASSWORD_AUTH"| COG
     JWT -->|"discovery URL / validación firma"| COG
     JWT --> REQINT
@@ -230,9 +239,13 @@ sequenceDiagram
 | Lambda Tool 3 | `santi-bank-consulta-canales-dev` | Estado de TODOS los canales (channels-data, scan) |
 | Lambda Tool 4 | `santi-bank-consulta-preferencias-dev` | Preferencias app (users-data) |
 | Lambda Setup | `santi-bank-setup-users-dev` | Custom Resource: users + seed data |
+| Lambda WAF Assoc | `santi-bank-waf-association-dev` | Custom Resource: asocia el WebACL al Gateway (con reintentos + auto-refresh del gateway) |
 | DynamoDB 1 | `santi-bank-fine-grained-access-mapping` | Matriz de permisos (FGAC) |
 | DynamoDB 2 | `santi-bank-users-data` | Datos bancarios de usuarios |
 | DynamoDB 3 | `santi-bank-channels-data` | Estado de canales |
+| WAF WebACL (regional) | `santi-bank-gateway-waf-dev` | Origin cloaking: asociado DIRECTAMENTE al Gateway |
+| Secrets Manager | `santi-bank-origin-verify-dev` | Secreto compartido CloudFront ↔ regla WAF (valor demo: `santi-aws`) |
+| CloudWatch Logs (WAF) | `aws-waf-logs-santi-bank-gateway-dev` | Logging de requests permitidos/bloqueados por WAF |
 
 ### Matriz de permisos (seed inicial)
 
@@ -377,6 +390,47 @@ En CDK (1 línea):
 exception_level=agentcore.GatewayExceptionLevel.DEBUG,
 ```
 
+### 7.3 🎯 Origin Cloaking: el Gateway SOLO acepta tráfico de CloudFront (WAF + Secrets Manager)
+
+El endpoint del Gateway (`*.gateway.bedrock-agentcore.*.amazonaws.com`) es público por naturaleza. Para que **solo CloudFront pueda llegarle**, el stack implementa *origin cloaking* con [WAF asociado directamente al AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-waf.html):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Atacante / cliente directo
+    participant C as Cliente legitimo (custom domain)
+    participant CF as CloudFront
+    participant W as WAF regional (en el Gateway)
+    participant GW as AgentCore Gateway
+
+    C->>CF: POST /mcp + Bearer JWT
+    CF->>W: Forward + header X-Origin-Verify: <secreto>
+    W->>W: Regla: header == secreto? ✅
+    W->>GW: ALLOW -> JWT auth -> interceptores -> tools
+    GW-->>C: HTTP 200 (flujo normal)
+
+    A->>W: POST directo al Gateway URL + Bearer JWT VALIDO
+    W->>W: Sin header X-Origin-Verify ❌
+    W-->>A: 🚫 BLOCK (403 / JSON-RPC -32002)<br/>aunque el token sea valido
+```
+
+| Componente | Configuración |
+|---|---|
+| **Secreto compartido** | Secrets Manager `santi-bank-origin-verify-dev` (valor demo: `santi-aws`). Referenciado vía *dynamic reference* de CloudFormation — no viaja hardcodeado entre recursos |
+| **CloudFront** | Origin custom header `X-Origin-Verify: <secreto>` inyectado hacia el Gateway |
+| **WAF WebACL regional** | Default action **BLOCK (403)**. Única regla ALLOW: `single_header x-origin-verify EXACTLY == secreto`. Asociado al Gateway con `wafv2 associate-web-acl` (custom resource) |
+| **Failure mode** | `FAIL_CLOSE` (default del Gateway: si WAF no responde, se bloquea) |
+| **Logging** | Log group `aws-waf-logs-santi-bank-gateway-dev` + métricas `WafBlocks` en `AWS/Bedrock-AgentCore` y métricas del WebACL |
+
+**Resultado validado:**
+
+| Invocación | Header inyectado | Resultado |
+|---|---|---|
+| Directa al Gateway URL (JWT válido) | ❌ No | 🚫 **BLOQUEADA por WAF** |
+| Vía `santi-bank-fine-access.cb.events.genai.aws.dev` (JWT válido) | ✅ CloudFront lo inyecta | ✅ Flujo completo (JWT → interceptores → tools) |
+
+> ⚠️ Nota de seguridad: la allowlist de IPs de CloudFront NO basta por sí sola (esas IPs son compartidas por todas las distribuciones del mundo) — el header secreto es el control determinante. En producción: rotar el secreto (Secrets Manager rotation + actualización de CloudFront/WAF) y complementar con WAF managed rules + rate limiting en el CloudFront.
+
 ---
 
 ## 8. Despliegue paso a paso
@@ -433,6 +487,8 @@ El Custom Resource (`santi-bank-setup-users-dev`) corre en **CREATE y UPDATE** d
 | 3 | Puebla `santi-bank-channels-data` (SVP, SVN, App, Valores, SantiBot) |
 | 4 | Puebla `santi-bank-fine-grained-access-mapping` (matriz de permisos) |
 
+Adicionalmente, el segundo Custom Resource (`santi-bank-waf-association-dev`) asocia el WebACL de origin cloaking **directamente al AgentCore Gateway** (`wafv2 associate-web-acl`), con lógica de resiliencia (ver 8.5).
+
 ### 8.4 Outputs del stack (valores reales del despliegue)
 
 | Output | Valor |
@@ -442,10 +498,27 @@ El Custom Resource (`santi-bank-setup-users-dev`) corre en **CREATE y UPDATE** d
 | `CognitoUserPoolId` | `us-east-1_Z0amGv9rk` |
 | `CognitoAppClientId` | `4ilvj9e26ovcv37g152tranglc` |
 | `CloudFrontDomain` | `d4te0tuscgxgn.cloudfront.net` |
+| `WafWebAclArn` | ARN del WebACL `santi-bank-gateway-waf-dev` (asociado al Gateway) |
+| `OriginVerifySecretName` | `santi-bank-origin-verify-dev` (Secrets Manager) |
+| `WafLogGroupName` | `aws-waf-logs-santi-bank-gateway-dev` |
+
+### 8.5 🔧 Troubleshooting: asociación WAF ↔ AgentCore Gateway (aprendizajes reales)
+
+Hallazgos empíricos de este despliegue (automatizados en `backend/lambdas/waf_association/handler.py`):
+
+| # | Síntoma | Causa raíz | Solución |
+|---|---|---|---|
+| 1 | `WAFUnavailableEntityException: AWS WAF couldn't retrieve the resource... Retry your request` **persistente** (no transitorio) al asociar | La infraestructura del Gateway existente no estaba aprovisionada para WAF | Ejecutar un **`UpdateGateway` NO-OP** (misma config) → re-aprovisiona el data plane → esperar `READY` → reintentar la asociación (funciona al primer intento) |
+| 2 | `ValidationException: wafConfiguration can only be set when a WebACL is associated with the gateway` | El `wafConfiguration` (FAIL_CLOSE/FAIL_OPEN) **NO** puede setearse antes de asociar | Asociar primero; el failure mode default ya es `FAIL_CLOSE` |
+| 3 | `AccessDeniedException ... wafv2:GetWebACL` al verificar con `get-web-acl-for-resource` | Esa API requiere **`wafv2:GetWebACL`** además de `GetWebACLForResource` | Incluir ambos permisos en el rol del custom resource |
+| 4 | `AlreadyExists / duplicate` del WebACL en re-despliegues tras un rollback | Un WebACL **asociado** no puede borrarse en rollback → queda huérfano | Disociar (`disassociate-web-acl`) + borrar (`delete-web-acl` con lock token) antes de re-desplegar |
+| 5 | `AWS::WAFv2::WebACLAssociation` (CloudFormation) | No documenta soporte para ARNs `bedrock-agentcore` | Custom resource Lambda llamando `wafv2:AssociateWebACL` directamente |
 
 ---
 
 ## 9. Cómo probarlo con MCP-Inspector
+
+> 🧱 **Importante (origin cloaking activo)**: usa SIEMPRE el **custom domain** — la invocación directa al Gateway URL retorna `403 Forbidden - Request blocked by AWS WAF`, incluso con JWT válido (¡ese es el feature!).
 
 ### 9.1 Obtener un token JWT (por usuario)
 
@@ -507,6 +580,32 @@ npx @modelcontextprotocol/inspector --cli $DOMAIN --transport http \
 ---
 
 ## 10. Cómo probarlo con Postman
+
+### 10.0 ⭐ Colección lista para importar (recomendado)
+
+Importa [`postman/santi-bank-fgac.postman_collection.json`](./postman/santi-bank-fgac.postman_collection.json) (Postman → **Import** → arrastra el archivo). Incluye:
+
+| Feature | Detalle |
+|---|---|
+| **Variables pre-configuradas** | `mcp_url`, `gateway_url_direct`, `client_id`, `password` — cero setup |
+| **Auto-autenticación por usuario** 🔑 | Cada folder (santi/jimmy/joacho) tiene un pre-request script que hace login en Cognito automáticamente y cachea el token 6h. Solo abre el folder y dale **Send** |
+| **47 tests automáticos** | Filtrado de `tools/list`, DENY con `isError:true` + mensaje, errores 401 diferenciados, origin cloaking |
+| **Folder 0 (opcional)** | Logins explícitos para VER el flujo Cognito en una demo |
+| **Folder 5 (opcional)** | Grant/revoke dinámico vía DynamoDB con SigV4 (requiere setear credenciales AWS en las variables) |
+| **Folder 6 (WAF)** 🧱 | Origin cloaking: invocación DIRECTA al Gateway URL → bloqueada (403/-32002) vs vía CloudFront → 200 OK |
+
+**Collection Runner**: corre los folders 0–4 completos → todos los tests en verde. También headless:
+
+```bash
+npx newman run postman/santi-bank-fgac.postman_collection.json \
+  --folder "1. santi (acceso TOTAL - 4 tools)" \
+  --folder "2. jimmy (SIN consulta_canales - 3 tools)" \
+  --folder "3. joacho (solo saldo + canales - 2 tools)" \
+  --folder "4. Errores de Auth (Hipotesis 2)"
+# Resultado validado: 43/43 assertions ✅
+```
+
+Las siguientes subsecciones explican los requests **manualmente** (por si quieres armarlos desde cero):
 
 ### 10.1 Request 1 — Obtener el token (Cognito)
 
@@ -599,10 +698,11 @@ Misma URL/headers (token de **jimmy**). **Body:**
 ### 11.1 Script E2E automatizado (el mismo que validó el despliegue)
 
 ```bash
-# Valida TODO: 3 usuarios x (list + call permitido + call denegado) + errores,
-# contra el Gateway URL directo Y el custom domain:
-python3 scripts/validate_fgac.py                # ambos endpoints
-python3 scripts/validate_fgac.py --url-mode domain   # solo custom domain
+# Valida TODO: 3 usuarios x (list + call permitido + call denegado) + errores
+# + ORIGIN CLOAKING (directa al Gateway = bloqueada vs CloudFront = OK):
+python3 scripts/validate_fgac.py                     # custom domain + test WAF (default)
+python3 scripts/validate_fgac.py --skip-waf-test     # sin el test de origin cloaking
+# Nota: '--url-mode gateway' fallara a proposito (el WAF bloquea el acceso directo)
 ```
 
 ### 11.2 curl manual
@@ -676,7 +776,21 @@ aws dynamodb update-item --region us-east-1 \
 | Token corrupto | `HTTP 401 · "Invalid Bearer token"` (mensaje DIFERENTE al anterior) |
 | Tool permitida pero username inexistente en data | HTTP 200 con error de negocio en el JSON de la tool |
 
-### DEMO 5 — Observabilidad (LOGGING SIGNIFICATIVO)
+### DEMO 5 — Origin Cloaking: "solo CloudFront puede llegar al Gateway" 🧱
+
+| Paso | Acción | Resultado esperado |
+|---|---|---|
+| 1 | Obtener token válido de `santi` | Token OK |
+| 2 | `POST` DIRECTO al Gateway URL (`*.gateway.bedrock-agentcore...amazonaws.com/mcp`) con ese token | 🚫 `HTTP 403` + `{"error":{"code":-32002,"message":"Forbidden - Request blocked by AWS WAF"}}` — bloqueado ANTES del JWT authorizer |
+| 3 | Misma petición vía `https://santi-bank-fine-access.cb.events.genai.aws.dev/mcp` | ✅ `HTTP 200` + tools (CloudFront inyectó `X-Origin-Verify`) |
+| 4 | Revisar el log del WAF | Entradas `ALLOW` (con header, regla `AllowOnlyCloudFrontWithOriginVerifyHeader`) y `BLOCK` (sin header) |
+
+```bash
+# Ver decisiones del WAF en tiempo real:
+aws logs tail aws-waf-logs-santi-bank-gateway-dev --region us-east-1 --follow
+```
+
+### DEMO 6 — Observabilidad (LOGGING SIGNIFICATIVO)
 
 ```bash
 # Ver la decisión FGAC en tiempo real (ALLOW/DENY, tools removidas, short-circuits):
@@ -699,7 +813,7 @@ Ejemplo real del log del interceptor durante un DENY:
 
 ## 13. Resultados de la validación E2E (2026-07-26) ✅
 
-Ejecutado contra el **Gateway URL directo** y el **custom domain (CloudFront)**: **20/20 PASS**.
+Validación inicial (pre-WAF) contra Gateway URL directo + custom domain: **20/20 PASS**. Validación final (con **origin cloaking** activo, vía custom domain + test WAF): **12/12 PASS** con el script + **47/47 assertions** con Postman/newman.
 
 | Validación | Resultado |
 |---|:---:|
@@ -713,6 +827,9 @@ Ejecutado contra el **Gateway URL directo** y el **custom domain (CloudFront)**:
 | Token inválido → `401 "Invalid Bearer token"` (diferenciado por ExceptionLevel DEBUG) | ✅ |
 | Revocación/otorgamiento DINÁMICO vía DynamoDB (sin redeploy) | ✅ |
 | mcp-inspector CLI (Streamable HTTP + Bearer) vía custom domain | ✅ |
+| **Origin cloaking**: invocación DIRECTA al Gateway URL con JWT válido → `403 {"error":{"code":-32002,"message":"Forbidden - Request blocked by AWS WAF"}}` | ✅ |
+| **Origin cloaking**: misma petición vía CloudFront (header `X-Origin-Verify` inyectado) → `200` + tools | ✅ |
+| WAF logging: decisiones ALLOW/BLOCK visibles en `aws-waf-logs-santi-bank-gateway-dev` (con regla terminante) | ✅ |
 
 ---
 
@@ -728,7 +845,8 @@ Ejecutado contra el **Gateway URL directo** y el **custom domain (CloudFront)**:
 │   ├── consulta_canales/handler.py        # Tool: estado de TODOS los canales (channels-data)
 │   ├── consulta_preferencias/handler.py   # Tool: preferencias app de un usuario (users-data)
 │   ├── fgac_interceptor/handler.py        # 🛡️ Interceptor FGAC (REQUEST + RESPONSE)
-│   └── setup_custom_resource/handler.py   # Custom Resource: users Cognito + seed DynamoDB
+│   ├── setup_custom_resource/handler.py   # Custom Resource: users Cognito + seed DynamoDB
+│   └── waf_association/handler.py         # 🧱 Custom Resource: WAF <-> Gateway (retries + refresh)
 ├── infrastructure/
 │   ├── cdk.json                       # app_config (dev): nombres, dominio, deny mode
 │   ├── pyproject.toml                 # Poetry (.venv en el root del proyecto CDK)
@@ -738,6 +856,8 @@ Ejecutado contra el **Gateway URL directo** y el **custom domain (CloudFront)**:
 │       ├── app.py                     # Entry point CDK (DEPLOYMENT_ENVIRONMENT)
 │       ├── helpers/add_tags.py        # Tags globales (Owner, Source, Environment...)
 │       └── stacks/cdk_santi_bank_stack.py  # Stack completo (métodos organizados)
+├── postman/
+│   └── santi-bank-fgac.postman_collection.json  # Colección Postman (auto-auth + 47 tests, incl. WAF)
 └── scripts/
     └── validate_fgac.py               # Validación E2E (20 checks, stdlib + AWS CLI)
 ```
@@ -763,6 +883,9 @@ poetry run cdk destroy --all --force
 | Notebook oficial FGAC con Data Store (base de este repo) | [agentcore-samples/06-workshops/.../02-fine-grained-access-control-using-data-store.ipynb](https://github.com/awslabs/agentcore-samples/blob/main/06-workshops/02-AgentCore-gateway/09-fine-grained-access-control/02-fine-grained-access-control-using-data-store/02-fine-grained-access-control-using-data-store.ipynb) |
 | Docs: Gateway Interceptors (tipos y contratos) | [docs.aws.amazon.com/bedrock-agentcore/.../gateway-interceptors-types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html) |
 | Docs: Configuración de interceptores (`passRequestHeaders`) | [docs.aws.amazon.com/bedrock-agentcore/.../gateway-interceptors-configuration](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-configuration.html) |
+| Docs: Protecting your gateway with AWS WAF (asociación, failure modes, métricas) | [docs.aws.amazon.com/bedrock-agentcore/.../gateway-waf](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-waf.html) |
+| Docs: PrivateLink / VPC endpoints para AgentCore (incl. endpoint dedicado de Gateway) | [docs.aws.amazon.com/bedrock-agentcore/.../vpc-interface-endpoints](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc-interface-endpoints.html) |
+| Blog: Limit access to your origins using the AWS-managed prefix list for CloudFront | [aws.amazon.com/blogs/networking-and-content-delivery/...](https://aws.amazon.com/blogs/networking-and-content-delivery/limit-access-to-your-origins-using-the-aws-managed-prefix-list-for-amazon-cloudfront/) |
 | CDK L2: `aws_bedrockagentcore` (Gateway, LambdaInterceptor, Targets) | [docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_bedrockagentcore-readme](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_bedrockagentcore-readme.html) |
 | MCP Inspector | [github.com/modelcontextprotocol/inspector](https://github.com/modelcontextprotocol/inspector) |
 

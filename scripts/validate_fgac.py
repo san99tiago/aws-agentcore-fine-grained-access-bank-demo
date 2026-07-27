@@ -215,9 +215,41 @@ def test_error_handling(url: str):
     check("[errors] Request with INVALID token is rejected (401/403)", status in (401, 403))
 
 
+def test_waf_origin_cloaking(gateway_url: str, domain_url: str, token: str):
+    """
+    ORIGIN CLOAKING test: with a VALID Cognito token,
+    - DIRECT Gateway URL invocation -> BLOCKED by the Gateway WAF (no X-Origin-Verify header)
+    - Custom domain (CloudFront injects the secret header) -> ALLOWED
+    """
+    print(f"\n{'=' * 70}")
+    print("WAF ORIGIN CLOAKING TESTS (solo CloudFront puede llegar al Gateway)")
+    print(f"{'=' * 70}")
+    payload = {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}}
+
+    status, body = mcp_request(gateway_url, token, payload)
+    body_str = json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else str(body)
+    print(f"  DIRECT Gateway URL (token valido) -> HTTP {status} | body: {body_str[:300]}")
+    blocked = status == 403 or (isinstance(body, dict) and body.get("error", {}).get("code") == -32002)
+    check(
+        "[waf] Invocacion DIRECTA al Gateway BLOQUEADA por WAF (aunque el JWT sea valido)",
+        blocked,
+        f"(HTTP {status})",
+    )
+
+    status, body = mcp_request(domain_url, token, payload)
+    tools = extract_tool_names(body) if isinstance(body, dict) else []
+    print(f"  Via CUSTOM DOMAIN (CloudFront) -> HTTP {status} | tools: {tools}")
+    check(
+        "[waf] Invocacion via CloudFront (X-Origin-Verify inyectado) PERMITIDA",
+        status == 200 and len(tools) > 0,
+        f"(HTTP {status}, {len(tools)} tools)",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url-mode", choices=["gateway", "domain", "both"], default="both")
+    parser.add_argument("--url-mode", choices=["gateway", "domain", "both"], default="domain")
+    parser.add_argument("--skip-waf-test", action="store_true", help="Skip the origin cloaking test")
     args = parser.parse_args()
 
     outputs = get_stack_outputs()
@@ -242,6 +274,13 @@ def main():
         for username in EXPECTED_PERMISSIONS:
             test_user(url, username, tokens[username])
         test_error_handling(url)
+
+    if not args.skip_waf_test:
+        test_waf_origin_cloaking(
+            gateway_url=outputs["GatewayUrl"],
+            domain_url=outputs["CustomDomainMcpUrl"],
+            token=tokens["santi"],
+        )
 
     print(f"\n\n{'=' * 70}")
     print(f"SUMMARY: {len(PASSED)} passed, {len(FAILED)} failed")

@@ -9,16 +9,20 @@ from aws_cdk import (
     CfnOutput,
     CustomResource,
     Fn,
+    SecretValue,
     aws_bedrockagentcore as agentcore,
     aws_certificatemanager as acm,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_cognito as cognito,
     aws_dynamodb as dynamodb,
+    aws_iam as iam,
     aws_lambda,
     aws_logs as logs,
     aws_route53 as route53,
     aws_route53_targets as route53_targets,
+    aws_secretsmanager as secretsmanager,
+    aws_wafv2 as wafv2,
     custom_resources as cr,
 )
 from constructs import Construct
@@ -68,6 +72,7 @@ class SantiBankFineAccessStack(Stack):
         self.create_agentcore_gateway()
         self.create_gateway_lambda_targets()
         self.create_setup_custom_resource()
+        self.create_waf_origin_cloaking()
         self.create_custom_domain_with_cloudfront()
         self.create_outputs()
 
@@ -417,6 +422,162 @@ class SantiBankFineAccessStack(Stack):
         self.setup_custom_resource.node.add_dependency(self.fgac_table)
         self.setup_custom_resource.node.add_dependency(self.user_pool)
 
+    def create_waf_origin_cloaking(self):
+        """
+        Method to create the ORIGIN CLOAKING security scheme so the AgentCore
+        Gateway ONLY accepts requests coming through CloudFront:
+        1. Secrets Manager secret (value "santi-aws") shared between CloudFront
+           and the WAF rule.
+        2. CloudFront injects the secret as origin custom header
+           "X-Origin-Verify" (see create_custom_domain_with_cloudfront).
+        3. Regional WAF WebACL associated DIRECTLY to the AgentCore Gateway:
+           default action BLOCK, single ALLOW rule when the header matches.
+        4. WAF logging to CloudWatch Logs (log group aws-waf-logs-*) +
+           CloudWatch metrics for observability.
+        Result: direct calls to the Gateway URL get BLOCKED by WAF; calls via
+        the custom domain (CloudFront) succeed.
+        """
+        # 1) Shared origin-verification secret (demo value explicitly requested)
+        self.origin_secret = secretsmanager.Secret(
+            self,
+            "Secret-OriginVerify",
+            secret_name=f"{self.main_resources_name}-origin-verify-{self.deployment_environment}",
+            description="Origin cloaking secret injected by CloudFront and validated by the Gateway WAF rule",
+            secret_string_value=SecretValue.unsafe_plain_text("santi-aws"),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        # CloudFormation dynamic reference: resolved at deploy time (not in code)
+        self.origin_secret_ref = self.origin_secret.secret_value.unsafe_unwrap()
+
+        # 2) Regional WebACL: default BLOCK + allow only when the secret header matches
+        waf_name = f"{self.main_resources_name}-gateway-waf-{self.deployment_environment}"
+        self.waf_web_acl = wafv2.CfnWebACL(
+            self,
+            "WAF-WebACL",
+            name=waf_name,
+            scope="REGIONAL",
+            description="Origin cloaking for santi-bank AgentCore Gateway - only CloudFront with X-Origin-Verify allowed",
+            default_action=wafv2.CfnWebACL.DefaultActionProperty(
+                block=wafv2.CfnWebACL.BlockActionProperty(
+                    custom_response=wafv2.CfnWebACL.CustomResponseProperty(
+                        response_code=403,
+                    )
+                )
+            ),
+            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                cloud_watch_metrics_enabled=True,
+                metric_name=waf_name,
+                sampled_requests_enabled=True,
+            ),
+            rules=[
+                wafv2.CfnWebACL.RuleProperty(
+                    name="AllowOnlyCloudFrontWithOriginVerifyHeader",
+                    priority=0,
+                    action=wafv2.CfnWebACL.RuleActionProperty(allow={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        byte_match_statement=wafv2.CfnWebACL.ByteMatchStatementProperty(
+                            search_string=self.origin_secret_ref,
+                            field_to_match=wafv2.CfnWebACL.FieldToMatchProperty(
+                                single_header={"Name": "x-origin-verify"}
+                            ),
+                            positional_constraint="EXACTLY",
+                            text_transformations=[
+                                wafv2.CfnWebACL.TextTransformationProperty(priority=0, type="NONE")
+                            ],
+                        )
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        metric_name=f"{waf_name}-allow-origin-verify",
+                        sampled_requests_enabled=True,
+                    ),
+                )
+            ],
+        )
+
+        # 3) WAF LOGGING to CloudWatch Logs (log group MUST start with aws-waf-logs-)
+        waf_log_group_name = f"aws-waf-logs-{self.main_resources_name}-gateway-{self.deployment_environment}"
+        self.waf_log_group = logs.LogGroup(
+            self,
+            "WAF-LogGroup",
+            log_group_name=waf_log_group_name,
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        waf_logging = wafv2.CfnLoggingConfiguration(
+            self,
+            "WAF-LoggingConfiguration",
+            resource_arn=self.waf_web_acl.attr_arn,
+            # WAF requires the log group ARN WITHOUT the trailing ':*'
+            log_destination_configs=[
+                f"arn:aws:logs:{self.region}:{self.account}:log-group:{waf_log_group_name}"
+            ],
+        )
+        waf_logging.node.add_dependency(self.waf_log_group)
+
+        # 4) Associate the WebACL DIRECTLY to the AgentCore Gateway via a
+        #    Python custom resource Lambda. Rationale: CFN association support
+        #    is not documented for bedrock-agentcore ARNs, and the association
+        #    can throw transient WAFUnavailableEntityException that requires a
+        #    NO-OP UpdateGateway (infra refresh) + retries to succeed.
+        self.lambda_waf_association = aws_lambda.Function(
+            self,
+            "Lambda-WafAssociation",
+            function_name=f"{self.main_resources_name}-waf-association-{self.deployment_environment}",
+            runtime=aws_lambda.Runtime.PYTHON_3_13,
+            architecture=aws_lambda.Architecture.ARM_64,
+            handler="handler.lambda_handler",
+            code=aws_lambda.Code.from_asset(os.path.join(LAMBDAS_PATH, "waf_association")),
+            timeout=Duration.minutes(10),
+            memory_size=256,
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+        self.lambda_waf_association.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "wafv2:AssociateWebACL",
+                    "wafv2:DisassociateWebACL",
+                    "wafv2:GetWebACL",
+                    "wafv2:GetWebACLForResource",
+                    "wafv2:ListResourcesForWebACL",
+                    "bedrock-agentcore:GatewayAssociateWebACL",
+                    "bedrock-agentcore:GatewayDisassociateWebACL",
+                    "bedrock-agentcore:GatewayGetWebACLForResource",
+                    "bedrock-agentcore:GatewayListResourcesForWebACL",
+                    "bedrock-agentcore:GetGateway",
+                    "bedrock-agentcore:UpdateGateway",
+                ],
+                resources=["*"],
+            )
+        )
+        # UpdateGateway (NO-OP refresh) requires passing the gateway service role
+        self.lambda_waf_association.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["iam:PassRole"],
+                resources=[self.gateway.role.role_arn],
+            )
+        )
+
+        waf_association_provider = cr.Provider(
+            self,
+            "WAF-AssociationProvider",
+            on_event_handler=self.lambda_waf_association,
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+        self.waf_gateway_association = CustomResource(
+            self,
+            "WAF-GatewayAssociation",
+            service_token=waf_association_provider.service_token,
+            resource_type="Custom::GatewayWafAssociation",
+            properties={
+                "WebAclArn": self.waf_web_acl.attr_arn,
+                "GatewayArn": self.gateway.gateway_arn,
+                "GatewayIdentifier": self.gateway.gateway_id,
+            },
+        )
+        self.waf_gateway_association.node.add_dependency(self.waf_web_acl)
+        self.waf_gateway_association.node.add_dependency(self.gateway)
+
     def create_custom_domain_with_cloudfront(self):
         """
         Method to create the custom domain for the MCP endpoint:
@@ -453,6 +614,9 @@ class SantiBankFineAccessStack(Stack):
                 origin=origins.HttpOrigin(
                     gateway_domain,
                     protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+                    # ORIGIN CLOAKING: CloudFront injects the shared secret so
+                    # the Gateway WAF rule only allows traffic coming from here
+                    custom_headers={"X-Origin-Verify": self.origin_secret_ref},
                 ),
                 allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
                 cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
@@ -493,6 +657,9 @@ class SantiBankFineAccessStack(Stack):
         CfnOutput(self, "CognitoUserPoolId", value=self.user_pool.user_pool_id)
         CfnOutput(self, "CognitoAppClientId", value=self.user_pool_client.user_pool_client_id)
         CfnOutput(self, "CognitoDiscoveryUrl", value=self.cognito_discovery_url)
+        CfnOutput(self, "WafWebAclArn", value=self.waf_web_acl.attr_arn)
+        CfnOutput(self, "OriginVerifySecretName", value=self.origin_secret.secret_name)
+        CfnOutput(self, "WafLogGroupName", value=self.waf_log_group.log_group_name)
         CfnOutput(self, "UsersTableName", value=self.users_table.table_name)
         CfnOutput(self, "ChannelsTableName", value=self.channels_table.table_name)
         CfnOutput(self, "FineGrainedAccessTableName", value=self.fgac_table.table_name)

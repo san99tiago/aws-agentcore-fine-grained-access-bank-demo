@@ -1,0 +1,980 @@
+{
+  "info": {
+    "name": "santi-bank :: AgentCore Gateway FGAC",
+    "description": "Coleccion E2E para validar Fine-Grained Access Control (FGAC) del AgentCore Gateway de santi-bank.\n\n## Como funciona la autenticacion (CERO fricciones)\n\nCada folder de usuario (santi / jimmy / joacho) tiene un PRE-REQUEST SCRIPT que:\n1. Revisa si hay un token cacheado para ese usuario (variable `token_<user>` con timestamp < 6h).\n2. Si no hay o expiro, hace login automatico contra Cognito (InitiateAuth USER_PASSWORD_AUTH).\n3. Setea `access_token` y `current_user` -> todos los requests del folder lo heredan via Bearer Auth.\n\nSolo abre el folder del usuario que quieras y dale Send (o corre TODA la coleccion con el Collection Runner y veras todos los tests en verde).\n\n## Matriz de permisos esperada\n\n| Usuario | saldo | tarjetas | canales | preferencias |\n|---|---|---|---|---|\n| santi | SI | SI | SI | SI |\n| jimmy | SI | SI | NO | SI |\n| joacho | SI | NO | SI | NO |\n\n## Origin Cloaking (WAF) 🧱\n\nEl Gateway tiene un WAF asociado que SOLO permite trafico con el header secreto X-Origin-Verify (inyectado por CloudFront). Por eso `gateway_url_direct` retorna 403/-32002 SIEMPRE (es el comportamiento esperado, validado en el Folder 6). Usa `mcp_url` (custom domain) para el flujo normal.\n\n## Variables\n\n- `mcp_url`: endpoint MCP (custom domain via CloudFront) - el UNICO camino permitido por el WAF.\n- `gateway_url_direct`: URL directa del Gateway - bloqueada por origin cloaking (solo util para el Folder 6).\n- `client_id` / `password`: credenciales demo de Cognito.\n- Folder 5 (opcional) requiere credenciales AWS (SigV4) para el flip dinamico de permisos en DynamoDB.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{access_token}}", "type": "string" }]
+  },
+  "variable": [
+    { "key": "mcp_url", "value": "https://santi-bank-fine-access.cb.events.genai.aws.dev/mcp", "type": "string" },
+    { "key": "gateway_url_direct", "value": "https://santi-bank-gateway-dev-kiogzebcfh.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp", "type": "string" },
+    { "key": "cognito_endpoint", "value": "https://cognito-idp.us-east-1.amazonaws.com/", "type": "string" },
+    { "key": "client_id", "value": "4ilvj9e26ovcv37g152tranglc", "type": "string" },
+    { "key": "password", "value": "Testing123.", "type": "string" },
+    { "key": "access_token", "value": "", "type": "string" },
+    { "key": "current_user", "value": "", "type": "string" },
+    { "key": "aws_access_key_id", "value": "", "type": "string" },
+    { "key": "aws_secret_access_key", "value": "", "type": "string" },
+    { "key": "aws_session_token", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "0. Auth manual (opcional - login explicito)",
+      "description": "Requests explicitos de login para VER el flujo de Cognito en la demo. NO son obligatorios: los folders 1-3 se auto-autentican solos con pre-request scripts.",
+      "item": [
+        {
+          "name": "Login santi",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Login santi -> HTTP 200', () => pm.response.to.have.status(200));",
+                  "const token = pm.response.json().AuthenticationResult?.AccessToken;",
+                  "pm.test('AccessToken presente', () => pm.expect(token).to.be.a('string').and.not.empty);",
+                  "pm.collectionVariables.set('token_santi', token);",
+                  "pm.collectionVariables.set('token_santi_ts', String(Date.now()));",
+                  "pm.collectionVariables.set('access_token', token);",
+                  "pm.collectionVariables.set('current_user', 'santi');",
+                  "console.log('Token de santi guardado y activado');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-amz-json-1.1" },
+              { "key": "X-Amz-Target", "value": "AWSCognitoIdentityProviderService.InitiateAuth" }
+            ],
+            "url": { "raw": "{{cognito_endpoint}}", "host": ["{{cognito_endpoint}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n  \"ClientId\": \"{{client_id}}\",\n  \"AuthParameters\": {\n    \"USERNAME\": \"santi\",\n    \"PASSWORD\": \"{{password}}\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "Login jimmy",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Login jimmy -> HTTP 200', () => pm.response.to.have.status(200));",
+                  "const token = pm.response.json().AuthenticationResult?.AccessToken;",
+                  "pm.test('AccessToken presente', () => pm.expect(token).to.be.a('string').and.not.empty);",
+                  "pm.collectionVariables.set('token_jimmy', token);",
+                  "pm.collectionVariables.set('token_jimmy_ts', String(Date.now()));",
+                  "pm.collectionVariables.set('access_token', token);",
+                  "pm.collectionVariables.set('current_user', 'jimmy');",
+                  "console.log('Token de jimmy guardado y activado');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-amz-json-1.1" },
+              { "key": "X-Amz-Target", "value": "AWSCognitoIdentityProviderService.InitiateAuth" }
+            ],
+            "url": { "raw": "{{cognito_endpoint}}", "host": ["{{cognito_endpoint}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n  \"ClientId\": \"{{client_id}}\",\n  \"AuthParameters\": {\n    \"USERNAME\": \"jimmy\",\n    \"PASSWORD\": \"{{password}}\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "Login joacho",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Login joacho -> HTTP 200', () => pm.response.to.have.status(200));",
+                  "const token = pm.response.json().AuthenticationResult?.AccessToken;",
+                  "pm.test('AccessToken presente', () => pm.expect(token).to.be.a('string').and.not.empty);",
+                  "pm.collectionVariables.set('token_joacho', token);",
+                  "pm.collectionVariables.set('token_joacho_ts', String(Date.now()));",
+                  "pm.collectionVariables.set('access_token', token);",
+                  "pm.collectionVariables.set('current_user', 'joacho');",
+                  "console.log('Token de joacho guardado y activado');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-amz-json-1.1" },
+              { "key": "X-Amz-Target", "value": "AWSCognitoIdentityProviderService.InitiateAuth" }
+            ],
+            "url": { "raw": "{{cognito_endpoint}}", "host": ["{{cognito_endpoint}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n  \"ClientId\": \"{{client_id}}\",\n  \"AuthParameters\": {\n    \"USERNAME\": \"joacho\",\n    \"PASSWORD\": \"{{password}}\"\n  }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. santi (acceso TOTAL - 4 tools)",
+      "description": "Auto-login como santi (pre-request script del folder). santi tiene TODAS las tools.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const username = 'santi';",
+              "const cached = pm.collectionVariables.get('token_' + username);",
+              "const ts = Number(pm.collectionVariables.get('token_' + username + '_ts') || 0);",
+              "if (cached && (Date.now() - ts) < 6 * 60 * 60 * 1000) {",
+              "    pm.collectionVariables.set('access_token', cached);",
+              "    pm.collectionVariables.set('current_user', username);",
+              "    console.log('[FGAC] Reusando token cacheado de ' + username);",
+              "} else {",
+              "    console.log('[FGAC] Login automatico como ' + username + '...');",
+              "    pm.sendRequest({",
+              "        url: pm.collectionVariables.get('cognito_endpoint'),",
+              "        method: 'POST',",
+              "        header: {",
+              "            'Content-Type': 'application/x-amz-json-1.1',",
+              "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'",
+              "        },",
+              "        body: { mode: 'raw', raw: JSON.stringify({",
+              "            AuthFlow: 'USER_PASSWORD_AUTH',",
+              "            ClientId: pm.collectionVariables.get('client_id'),",
+              "            AuthParameters: { USERNAME: username, PASSWORD: pm.collectionVariables.get('password') }",
+              "        })}",
+              "    }, (err, res) => {",
+              "        if (err) { console.error('[FGAC] Error de login:', err); return; }",
+              "        const token = res.json().AuthenticationResult?.AccessToken;",
+              "        if (!token) { console.error('[FGAC] Sin AccessToken:', res.text()); return; }",
+              "        pm.collectionVariables.set('token_' + username, token);",
+              "        pm.collectionVariables.set('token_' + username + '_ts', String(Date.now()));",
+              "        pm.collectionVariables.set('access_token', token);",
+              "        pm.collectionVariables.set('current_user', username);",
+              "        console.log('[FGAC] Token de ' + username + ' obtenido y activado');",
+              "    });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "tools/list (espera 4 tools)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "const tools = (body.result?.tools || []).map(t => t.name.split('___').pop()).sort();",
+                  "console.log('[FGAC] Tools visibles para santi:', tools);",
+                  "pm.test('santi VE exactamente 4 tools', () => pm.expect(tools).to.have.lengthOf(4));",
+                  "pm.test('santi ve TODAS las tools esperadas', () => {",
+                  "    pm.expect(tools).to.eql(['consulta_canales','consulta_preferencias','consulta_saldo','consulta_tarjetas']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_saldo (PERMITIDA)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('isError = false (ejecucion PERMITIDA)', () => pm.expect(body.result?.isError).to.not.be.true);",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "console.log('[FGAC] Resultado:', text.substring(0, 300));",
+                  "pm.test('Retorna saldo real de santi-bank', () => {",
+                  "    pm.expect(text).to.include('santi-bank');",
+                  "    pm.expect(text).to.include('saldo_disponible');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-saldo___consulta_saldo\",\n    \"arguments\": { \"username\": \"{{current_user}}\" }\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_canales (PERMITIDA)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('isError = false (ejecucion PERMITIDA)', () => pm.expect(body.result?.isError).to.not.be.true);",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "console.log('[FGAC] Canales:', text.substring(0, 400));",
+                  "pm.test('Retorna los 5 canales (SVP, SVN, MiBancoApp, Valores, SantiBot)', () => {",
+                  "    pm.expect(text).to.include('SantiBot');",
+                  "    pm.expect(text).to.include('MiBancoApp');",
+                  "    pm.expect(text).to.include('\"total_canales\":5');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-canales___consulta_canales\",\n    \"arguments\": {}\n  }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. jimmy (SIN consulta_canales - 3 tools)",
+      "description": "Auto-login como jimmy. Puede: saldo, tarjetas, preferencias. NO puede: canales (ni verla ni ejecutarla).",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const username = 'jimmy';",
+              "const cached = pm.collectionVariables.get('token_' + username);",
+              "const ts = Number(pm.collectionVariables.get('token_' + username + '_ts') || 0);",
+              "if (cached && (Date.now() - ts) < 6 * 60 * 60 * 1000) {",
+              "    pm.collectionVariables.set('access_token', cached);",
+              "    pm.collectionVariables.set('current_user', username);",
+              "    console.log('[FGAC] Reusando token cacheado de ' + username);",
+              "} else {",
+              "    console.log('[FGAC] Login automatico como ' + username + '...');",
+              "    pm.sendRequest({",
+              "        url: pm.collectionVariables.get('cognito_endpoint'),",
+              "        method: 'POST',",
+              "        header: {",
+              "            'Content-Type': 'application/x-amz-json-1.1',",
+              "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'",
+              "        },",
+              "        body: { mode: 'raw', raw: JSON.stringify({",
+              "            AuthFlow: 'USER_PASSWORD_AUTH',",
+              "            ClientId: pm.collectionVariables.get('client_id'),",
+              "            AuthParameters: { USERNAME: username, PASSWORD: pm.collectionVariables.get('password') }",
+              "        })}",
+              "    }, (err, res) => {",
+              "        if (err) { console.error('[FGAC] Error de login:', err); return; }",
+              "        const token = res.json().AuthenticationResult?.AccessToken;",
+              "        if (!token) { console.error('[FGAC] Sin AccessToken:', res.text()); return; }",
+              "        pm.collectionVariables.set('token_' + username, token);",
+              "        pm.collectionVariables.set('token_' + username + '_ts', String(Date.now()));",
+              "        pm.collectionVariables.set('access_token', token);",
+              "        pm.collectionVariables.set('current_user', username);",
+              "        console.log('[FGAC] Token de ' + username + ' obtenido y activado');",
+              "    });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "tools/list (espera 3 tools, SIN canales)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "const tools = (body.result?.tools || []).map(t => t.name.split('___').pop()).sort();",
+                  "console.log('[FGAC] Tools visibles para jimmy:', tools);",
+                  "pm.test('jimmy VE exactamente 3 tools', () => pm.expect(tools).to.have.lengthOf(3));",
+                  "pm.test('HIPOTESIS 1A: consulta_canales FILTRADA del listado (RESPONSE interceptor)', () => {",
+                  "    pm.expect(tools).to.not.include('consulta_canales');",
+                  "});",
+                  "pm.test('jimmy ve saldo, tarjetas y preferencias', () => {",
+                  "    pm.expect(tools).to.eql(['consulta_preferencias','consulta_saldo','consulta_tarjetas']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_tarjetas (PERMITIDA)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('isError = false (ejecucion PERMITIDA)', () => pm.expect(body.result?.isError).to.not.be.true);",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "console.log('[FGAC] Tarjetas:', text.substring(0, 300));",
+                  "pm.test('Retorna tarjetas de jimmy (AMEX)', () => pm.expect(text).to.include('AMEX'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-tarjetas___consulta_tarjetas\",\n    \"arguments\": { \"username\": \"{{current_user}}\" }\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_canales (DENEGADA - peticion armada) ⭐",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200 (el DENY viaja como 200 + isError para no perder el mensaje)', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('HIPOTESIS 1B: isError = true (REQUEST interceptor bloqueo la ejecucion)', () => {",
+                  "    pm.expect(body.result?.isError).to.be.true;",
+                  "});",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "console.log('[FGAC] Mensaje de DENY:', text);",
+                  "pm.test('Mensaje claro de ACCESO DENEGADO con detalle', () => {",
+                  "    pm.expect(text).to.include('ACCESO DENEGADO');",
+                  "    pm.expect(text).to.include('jimmy');",
+                  "    pm.expect(text).to.include('consulta_canales');",
+                  "});",
+                  "pm.test('El mensaje incluye las tools SI permitidas (agente puede reaccionar)', () => {",
+                  "    pm.expect(text).to.include('consulta_saldo');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-canales___consulta_canales\",\n    \"arguments\": {}\n  }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. joacho (solo saldo + canales - 2 tools)",
+      "description": "Auto-login como joacho. Puede: saldo, canales. NO puede: tarjetas ni preferencias.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const username = 'joacho';",
+              "const cached = pm.collectionVariables.get('token_' + username);",
+              "const ts = Number(pm.collectionVariables.get('token_' + username + '_ts') || 0);",
+              "if (cached && (Date.now() - ts) < 6 * 60 * 60 * 1000) {",
+              "    pm.collectionVariables.set('access_token', cached);",
+              "    pm.collectionVariables.set('current_user', username);",
+              "    console.log('[FGAC] Reusando token cacheado de ' + username);",
+              "} else {",
+              "    console.log('[FGAC] Login automatico como ' + username + '...');",
+              "    pm.sendRequest({",
+              "        url: pm.collectionVariables.get('cognito_endpoint'),",
+              "        method: 'POST',",
+              "        header: {",
+              "            'Content-Type': 'application/x-amz-json-1.1',",
+              "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'",
+              "        },",
+              "        body: { mode: 'raw', raw: JSON.stringify({",
+              "            AuthFlow: 'USER_PASSWORD_AUTH',",
+              "            ClientId: pm.collectionVariables.get('client_id'),",
+              "            AuthParameters: { USERNAME: username, PASSWORD: pm.collectionVariables.get('password') }",
+              "        })}",
+              "    }, (err, res) => {",
+              "        if (err) { console.error('[FGAC] Error de login:', err); return; }",
+              "        const token = res.json().AuthenticationResult?.AccessToken;",
+              "        if (!token) { console.error('[FGAC] Sin AccessToken:', res.text()); return; }",
+              "        pm.collectionVariables.set('token_' + username, token);",
+              "        pm.collectionVariables.set('token_' + username + '_ts', String(Date.now()));",
+              "        pm.collectionVariables.set('access_token', token);",
+              "        pm.collectionVariables.set('current_user', username);",
+              "        console.log('[FGAC] Token de ' + username + ' obtenido y activado');",
+              "    });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "tools/list (espera 2 tools)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "const tools = (body.result?.tools || []).map(t => t.name.split('___').pop()).sort();",
+                  "console.log('[FGAC] Tools visibles para joacho:', tools);",
+                  "pm.test('joacho VE exactamente 2 tools', () => pm.expect(tools).to.have.lengthOf(2));",
+                  "pm.test('joacho ve solo saldo y canales', () => {",
+                  "    pm.expect(tools).to.eql(['consulta_canales','consulta_saldo']);",
+                  "});",
+                  "pm.test('tarjetas y preferencias FILTRADAS del listado', () => {",
+                  "    pm.expect(tools).to.not.include('consulta_tarjetas');",
+                  "    pm.expect(tools).to.not.include('consulta_preferencias');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_canales (PERMITIDA)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('isError = false (ejecucion PERMITIDA)', () => pm.expect(body.result?.isError).to.not.be.true);",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "pm.test('Retorna los canales (incluye SantiBot)', () => pm.expect(text).to.include('SantiBot'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-canales___consulta_canales\",\n    \"arguments\": {}\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_tarjetas (DENEGADA) ⭐",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('HIPOTESIS 1B: isError = true (bloqueada por REQUEST interceptor)', () => {",
+                  "    pm.expect(body.result?.isError).to.be.true;",
+                  "});",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "console.log('[FGAC] Mensaje de DENY:', text);",
+                  "pm.test('Mensaje claro: joacho NO puede ejecutar consulta_tarjetas', () => {",
+                  "    pm.expect(text).to.include('ACCESO DENEGADO');",
+                  "    pm.expect(text).to.include('joacho');",
+                  "    pm.expect(text).to.include('consulta_tarjetas');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-tarjetas___consulta_tarjetas\",\n    \"arguments\": { \"username\": \"{{current_user}}\" }\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "tools/call consulta_preferencias (DENEGADA) ⭐",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "pm.test('HIPOTESIS 1B: isError = true (bloqueada por REQUEST interceptor)', () => {",
+                  "    pm.expect(body.result?.isError).to.be.true;",
+                  "});",
+                  "const text = body.result?.content?.[0]?.text || '';",
+                  "pm.test('Mensaje claro: joacho NO puede ejecutar consulta_preferencias', () => {",
+                  "    pm.expect(text).to.include('ACCESO DENEGADO');",
+                  "    pm.expect(text).to.include('consulta_preferencias');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\", \"id\": 4, \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"consulta-preferencias___consulta_preferencias\",\n    \"arguments\": { \"username\": \"{{current_user}}\" }\n  }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Errores de Auth (Hipotesis 2)",
+      "description": "Valida que el Gateway (ExceptionLevel DEBUG) retorna mensajes DIFERENCIADOS para cada tipo de error de token (no el mismo mensaje generico).",
+      "item": [
+        {
+          "name": "tools/list SIN token (espera 401 Missing Bearer token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 401 (rechazado ANTES de los interceptores)', () => pm.response.to.have.status(401));",
+                  "const body = pm.response.json();",
+                  "console.log('[FGAC] Error:', JSON.stringify(body));",
+                  "pm.test('HIPOTESIS 2: mensaje especifico \"Missing Bearer token\"', () => {",
+                  "    pm.expect(body.error?.message).to.eql('Missing Bearer token');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 9, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        },
+        {
+          "name": "tools/list token INVALIDO (espera 401 Invalid Bearer token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 401', () => pm.response.to.have.status(401));",
+                  "const body = pm.response.json();",
+                  "console.log('[FGAC] Error:', JSON.stringify(body));",
+                  "pm.test('HIPOTESIS 2: mensaje especifico \"Invalid Bearer token\" (DIFERENTE al de token faltante)', () => {",
+                  "    pm.expect(body.error?.message).to.eql('Invalid Bearer token');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [{ "key": "token", "value": "invalid.jwt.token", "type": "string" }]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 9, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Permisos dinamicos via DynamoDB (opcional - requiere credenciales AWS)",
+      "description": "OPCIONAL: flip dinamico del permiso consulta_canales para jimmy directo en DynamoDB (SigV4).\n\nRequiere setear las variables `aws_access_key_id`, `aws_secret_access_key` y `aws_session_token` de la coleccion (dejalas vacias si no lo vas a usar; NO exportes la coleccion con credenciales puestas).\n\nFlujo demo: 1) OTORGAR -> 2) correr folder jimmy (vera 4 tools y canales OK... los tests de 3 tools fallaran a proposito, demostrando el cambio) -> 3) REVOCAR -> 4) correr folder jimmy de nuevo (todo verde).",
+      "item": [
+        {
+          "name": "OTORGAR consulta_canales a jimmy (Allowed=true)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('UpdateItem OK (HTTP 200)', () => pm.response.to.have.status(200));",
+                  "console.log('[FGAC] Permiso OTORGADO: jimmy ahora puede ver/ejecutar consulta_canales (efecto INMEDIATO, sin redeploy)');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "awsv4",
+              "awsv4": [
+                { "key": "accessKey", "value": "{{aws_access_key_id}}", "type": "string" },
+                { "key": "secretKey", "value": "{{aws_secret_access_key}}", "type": "string" },
+                { "key": "sessionToken", "value": "{{aws_session_token}}", "type": "string" },
+                { "key": "region", "value": "us-east-1", "type": "string" },
+                { "key": "service", "value": "dynamodb", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-amz-json-1.0" },
+              { "key": "X-Amz-Target", "value": "DynamoDB_20120810.UpdateItem" }
+            ],
+            "url": { "raw": "https://dynamodb.us-east-1.amazonaws.com/", "protocol": "https", "host": ["dynamodb", "us-east-1", "amazonaws", "com"], "path": [""] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"TableName\": \"santi-bank-fine-grained-access-mapping\",\n  \"Key\": { \"PK\": {\"S\": \"USER#jimmy\"}, \"SK\": {\"S\": \"TOOL#consulta_canales\"} },\n  \"UpdateExpression\": \"SET Allowed = :v\",\n  \"ExpressionAttributeValues\": { \":v\": {\"BOOL\": true} }\n}"
+            }
+          }
+        },
+        {
+          "name": "REVOCAR consulta_canales a jimmy (Allowed=false)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('UpdateItem OK (HTTP 200)', () => pm.response.to.have.status(200));",
+                  "console.log('[FGAC] Permiso REVOCADO: jimmy vuelve a estar bloqueado para consulta_canales (efecto INMEDIATO)');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "awsv4",
+              "awsv4": [
+                { "key": "accessKey", "value": "{{aws_access_key_id}}", "type": "string" },
+                { "key": "secretKey", "value": "{{aws_secret_access_key}}", "type": "string" },
+                { "key": "sessionToken", "value": "{{aws_session_token}}", "type": "string" },
+                { "key": "region", "value": "us-east-1", "type": "string" },
+                { "key": "service", "value": "dynamodb", "type": "string" }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-amz-json-1.0" },
+              { "key": "X-Amz-Target", "value": "DynamoDB_20120810.UpdateItem" }
+            ],
+            "url": { "raw": "https://dynamodb.us-east-1.amazonaws.com/", "protocol": "https", "host": ["dynamodb", "us-east-1", "amazonaws", "com"], "path": [""] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"TableName\": \"santi-bank-fine-grained-access-mapping\",\n  \"Key\": { \"PK\": {\"S\": \"USER#jimmy\"}, \"SK\": {\"S\": \"TOOL#consulta_canales\"} },\n  \"UpdateExpression\": \"SET Allowed = :v\",\n  \"ExpressionAttributeValues\": { \":v\": {\"BOOL\": false} }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. WAF Origin Cloaking (solo CloudFront)",
+      "description": "Valida que el Gateway SOLO acepta trafico de CloudFront: la invocacion DIRECTA al Gateway URL es BLOQUEADA por el WAF (falta el header X-Origin-Verify que CloudFront inyecta), aunque el JWT sea valido. La misma peticion via el custom domain funciona.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const username = 'santi';",
+              "const cached = pm.collectionVariables.get('token_' + username);",
+              "const ts = Number(pm.collectionVariables.get('token_' + username + '_ts') || 0);",
+              "if (cached && (Date.now() - ts) < 6 * 60 * 60 * 1000) {",
+              "    pm.collectionVariables.set('access_token', cached);",
+              "    pm.collectionVariables.set('current_user', username);",
+              "} else {",
+              "    pm.sendRequest({",
+              "        url: pm.collectionVariables.get('cognito_endpoint'),",
+              "        method: 'POST',",
+              "        header: {",
+              "            'Content-Type': 'application/x-amz-json-1.1',",
+              "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'",
+              "        },",
+              "        body: { mode: 'raw', raw: JSON.stringify({",
+              "            AuthFlow: 'USER_PASSWORD_AUTH',",
+              "            ClientId: pm.collectionVariables.get('client_id'),",
+              "            AuthParameters: { USERNAME: username, PASSWORD: pm.collectionVariables.get('password') }",
+              "        })}",
+              "    }, (err, res) => {",
+              "        if (err) { console.error('[FGAC] Error de login:', err); return; }",
+              "        const token = res.json().AuthenticationResult?.AccessToken;",
+              "        if (!token) { console.error('[FGAC] Sin AccessToken:', res.text()); return; }",
+              "        pm.collectionVariables.set('token_' + username, token);",
+              "        pm.collectionVariables.set('token_' + username + '_ts', String(Date.now()));",
+              "        pm.collectionVariables.set('access_token', token);",
+              "        pm.collectionVariables.set('current_user', username);",
+              "    });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "Invocacion DIRECTA al Gateway (espera BLOCK por WAF) 🧱",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "console.log('[WAF] Status:', pm.response.code, '| Body:', pm.response.text().substring(0, 300));",
+                  "pm.test('ORIGIN CLOAKING: invocacion directa BLOQUEADA (403 o JSON-RPC -32002) aunque el JWT sea valido', () => {",
+                  "    let jsonRpcForbidden = false;",
+                  "    try {",
+                  "        const b = pm.response.json();",
+                  "        jsonRpcForbidden = b.error?.code === -32002;",
+                  "    } catch (e) {}",
+                  "    pm.expect(pm.response.code === 403 || jsonRpcForbidden, 'expected 403 or -32002').to.be.true;",
+                  "});",
+                  "pm.test('NO retorna tools (el request nunca llego a los targets)', () => {",
+                  "    pm.expect(pm.response.text()).to.not.include('consulta_saldo');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{gateway_url_direct}}", "host": ["{{gateway_url_direct}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 7, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        },
+        {
+          "name": "Misma peticion via CloudFront (espera 200 OK) ✅",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function parseMcp() {",
+                  "    let text = pm.response.text();",
+                  "    if (text.includes('data:')) {",
+                  "        const line = text.split(/\\r?\\n/).find(l => l.startsWith('data:'));",
+                  "        if (line) text = line.slice(5).trim();",
+                  "    }",
+                  "    return JSON.parse(text);",
+                  "}",
+                  "pm.test('Via custom domain (CloudFront inyecta X-Origin-Verify) -> HTTP 200', () => pm.response.to.have.status(200));",
+                  "const body = parseMcp();",
+                  "const tools = (body.result?.tools || []).map(t => t.name.split('___').pop());",
+                  "console.log('[WAF] Tools via CloudFront:', tools);",
+                  "pm.test('Retorna las tools (flujo completo JWT + interceptores + targets)', () => {",
+                  "    pm.expect(tools.length).to.be.above(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json, text/event-stream" }
+            ],
+            "url": { "raw": "{{mcp_url}}", "host": ["{{mcp_url}}"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"jsonrpc\": \"2.0\", \"id\": 7, \"method\": \"tools/list\", \"params\": {} }"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
