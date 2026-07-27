@@ -52,6 +52,10 @@ El equipo del cliente tenía la validación AuthN/AuthZ **solo en el interceptor
 
 ## 2. Arquitectura general
 
+> 📐 Diagrama Draw.io (iconos AWS oficiales) del flujo E2E: [`assets/santi-bank-fgac-e2e.drawio`](./assets/santi-bank-fgac-e2e.drawio) · PNG DPI-400: [`assets/santi-bank-fgac-e2e.png`](./assets/santi-bank-fgac-e2e.png)
+
+![santi-bank FGAC + Origin Cloaking - Flujo E2E AWS](./assets/santi-bank-fgac-e2e.png)
+
 ```mermaid
 flowchart TB
     subgraph CLIENT["🧑‍💻 Cliente MCP (mcp-inspector / Postman / Agente IA)"]
