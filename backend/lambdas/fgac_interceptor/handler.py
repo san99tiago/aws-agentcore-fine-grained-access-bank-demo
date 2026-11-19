@@ -45,6 +45,23 @@ DENY_MODE = os.environ.get("DENY_MODE", "mcp_error")
 dynamodb = boto3.resource("dynamodb")
 fgac_table = dynamodb.Table(FGAC_TABLE_NAME)
 
+# Headers that must NEVER reach CloudWatch Logs in clear text. With
+# passRequestHeaders=true the interceptor receives ALL request headers,
+# including the origin cloaking secret injected by CloudFront.
+SENSITIVE_LOG_HEADERS = {"x-origin-verify"}
+
+
+def sanitize_for_logging(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of the interceptor event with sensitive headers redacted."""
+    safe_event = json.loads(json.dumps(event, default=str))
+    for section in ("gatewayRequest", "gatewayResponse"):
+        headers = ((safe_event.get("mcp") or {}).get(section) or {}).get("headers")
+        if isinstance(headers, dict):
+            for key in list(headers):
+                if key.lower() in SENSITIVE_LOG_HEADERS:
+                    headers[key] = "***REDACTED***"
+    return safe_event
+
 
 # ------------------------------------------------------------------------
 # JWT HELPERS
@@ -331,8 +348,8 @@ def handle_response_interception(mcp_data: Dict[str, Any]) -> Dict[str, Any]:
 def lambda_handler(event, context):
     """Main handler for the santi-bank FGAC Gateway Interceptor."""
     print("=" * 80)
-    print("[FGAC] Received interceptor event:")
-    print(json.dumps(event, default=str))
+    print("[FGAC] Received interceptor event (sensitive headers redacted):")
+    print(json.dumps(sanitize_for_logging(event), default=str))
 
     try:
         mcp_data = event.get("mcp", {})

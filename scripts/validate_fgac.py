@@ -9,15 +9,23 @@ Validates the AgentCore Gateway FGAC deployment end-to-end:
 4. HYPOTHESIS 1 (InvokeTool): tools/call is blocked per-user by the REQUEST interceptor
    ("you can SEE the tool but NOT execute it" + forged calls to hidden tools).
 5. HYPOTHESIS 2 (Errors): empty/invalid tokens produce meaningful error responses.
+6. ORIGIN CLOAKING (WAF SHA-256): the WAF only stores the SHA-256 digest of the
+   origin-verify secret, redacts the header in logs/samples, blocks direct calls
+   (no header, wrong header, legacy demo value) and accepts the right header.
 
-Zero external dependencies (stdlib + AWS CLI for Cognito auth).
+Zero external dependencies (stdlib + AWS CLI for Cognito, WAF and Secrets Manager).
+The origin-verify secret is read in memory for the tests and NEVER printed.
 
 Usage:
     python3 scripts/validate_fgac.py [--url-mode gateway|domain|both]
 """
 
 import argparse
+import base64
+import hashlib
 import json
+import os
+import secrets
 import subprocess
 import sys
 import urllib.request
@@ -26,6 +34,9 @@ import urllib.error
 STACK_NAME = "santi-bank-fine-access-dev"
 REGION = "us-east-1"
 PASSWORD = "Testing123."
+CDK_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "infrastructure", "cdk.json")
+ORIGIN_VERIFY_RULE_NAME = "AllowOnlyCloudFrontWithOriginVerifyHeader"
+LEGACY_DEMO_SECRET = "santi-aws"  # Old plain-text demo value (must be rejected after the migration)
 
 # Expected permissions matrix (must match the Custom Resource seeding)
 EXPECTED_PERMISSIONS = {
@@ -100,7 +111,7 @@ def get_token(client_id: str, username: str) -> str:
     return result.stdout.strip()
 
 
-def mcp_request(url: str, token: str, payload: dict, timeout: int = 60):
+def mcp_request(url: str, token: str, payload: dict, timeout: int = 60, extra_headers: dict = None):
     """POST an MCP JSON-RPC request. Returns (status_code, parsed_body_or_text)."""
     data = json.dumps(payload).encode()
     request = urllib.request.Request(
@@ -110,6 +121,7 @@ def mcp_request(url: str, token: str, payload: dict, timeout: int = 60):
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             **({"Authorization": f"Bearer {token}"} if token else {}),
+            **(extra_headers or {}),
         },
         method="POST",
     )
@@ -215,10 +227,96 @@ def test_error_handling(url: str):
     check("[errors] Request with INVALID token is rejected (401/403)", status in (401, 403))
 
 
-def test_waf_origin_cloaking(gateway_url: str, domain_url: str, token: str):
+def sha256_b64(value: str) -> str:
+    """Base64 of the RAW SHA-256 digest (same format the WAF SearchString stores)."""
+    return base64.b64encode(hashlib.sha256(value.encode("utf-8")).digest()).decode("ascii")
+
+
+def get_origin_secret(secret_name: str, stage: str = "AWSCURRENT"):
+    """Read an origin-verify secret version IN MEMORY (never printed). None if the stage is absent."""
+    try:
+        return _aws(["secretsmanager", "get-secret-value", "--secret-id", secret_name,
+                     "--version-stage", stage, "--query", "SecretString", "--output", "text"])
+    except subprocess.CalledProcessError:
+        return None
+
+
+def accepts_previous_secret() -> bool:
+    """Read the rotation-window flag from cdk.json (dev environment)."""
+    try:
+        with open(CDK_JSON_PATH) as f:
+            app_config = json.load(f)["context"]["app_config"]["dev"]
+        return bool(app_config.get("origin_verify_accept_previous_secret", False))
+    except (OSError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def collect_byte_matches(statement: dict) -> list:
+    """Return every ByteMatchStatement of a rule (single statement or OrStatement)."""
+    if "ByteMatchStatement" in statement:
+        return [statement["ByteMatchStatement"]]
+    matches = []
+    for child in (statement.get("OrStatement") or {}).get("Statements", []):
+        matches.extend(collect_byte_matches(child))
+    return matches
+
+
+def is_blocked(status: int, body) -> bool:
+    return status == 403 or (isinstance(body, dict) and (body.get("error") or {}).get("code") == -32002)
+
+
+def test_waf_sha256_config(web_acl_arn: str, origin_secret: str):
+    """
+    WAF CONFIG test (what Ciber reviews): the rule must store ONLY the SHA-256
+    digest of the secret, use the SHA256 text transformation, and the header
+    must be protected (REDACTED) in WAF logs and sampled requests.
+    """
+    print(f"\n{'=' * 70}")
+    print("WAF SHA-256 CONFIG TESTS (el WAF NO guarda el secreto en claro)")
+    print(f"{'=' * 70}")
+    # arn:aws:wafv2:<region>:<account>:regional/webacl/<name>/<id>
+    _, _, name, acl_id = web_acl_arn.split(":")[-1].split("/")
+    web_acl = json.loads(_aws(["wafv2", "get-web-acl", "--scope", "REGIONAL", "--name", name,
+                               "--id", acl_id, "--output", "json"]))["WebACL"]
+    rule = next((r for r in web_acl.get("Rules", []) if r["Name"] == ORIGIN_VERIFY_RULE_NAME), None)
+    check("[waf-sha256] Regla de origin cloaking presente", rule is not None, f"({ORIGIN_VERIFY_RULE_NAME})")
+    if rule is None:
+        return
+
+    matches = collect_byte_matches(rule["Statement"])
+    transformations = sorted({t["Type"] for m in matches for t in m.get("TextTransformations", [])})
+    print(f"  ByteMatch statements: {len(matches)} | text transformations: {transformations}")
+    check("[waf-sha256] Text transformation = SHA256 en todos los ByteMatch",
+          len(matches) > 0 and transformations == ["SHA256"])
+
+    expected_digest = sha256_b64(origin_secret)
+    stored = [m.get("SearchString", "") for m in matches]  # AWS CLI shows blobs as base64
+    print(f"  Digest esperado (prefijo): {expected_digest[:8]}... | digests en WAF (prefijos): "
+          f"{[s[:8] + '...' for s in stored]}")
+    check("[waf-sha256] SearchString = base64(SHA-256(secreto actual))", expected_digest in stored)
+
+    web_acl_dump = json.dumps(web_acl)
+    plain_b64 = base64.b64encode(origin_secret.encode("utf-8")).decode("ascii")
+    check("[waf-sha256] El secreto NO aparece en la config del WAF (ni plano ni en base64)",
+          origin_secret not in web_acl_dump and plain_b64 not in web_acl_dump)
+
+    protections = (web_acl.get("DataProtectionConfig") or {}).get("DataProtections", [])
+    protected = any(
+        p["Field"]["FieldType"] == "SINGLE_HEADER"
+        and "x-origin-verify" in [k.lower() for k in p["Field"].get("FieldKeys", [])]
+        for p in protections
+    )
+    check("[waf-sha256] Data protection: header x-origin-verify protegido en logs y sampled requests",
+          protected)
+
+
+def test_waf_origin_cloaking(gateway_url: str, domain_url: str, token: str, origin_secret: str = None,
+                             previous_secret: str = None):
     """
     ORIGIN CLOAKING test: with a VALID Cognito token,
     - DIRECT Gateway URL invocation -> BLOCKED by the Gateway WAF (no X-Origin-Verify header)
+    - DIRECT with a WRONG header / the legacy demo value -> BLOCKED
+    - DIRECT with the RIGHT header -> ALLOWED (proves WAF hashes the header with SHA256)
     - Custom domain (CloudFront injects the secret header) -> ALLOWED
     """
     print(f"\n{'=' * 70}")
@@ -229,12 +327,43 @@ def test_waf_origin_cloaking(gateway_url: str, domain_url: str, token: str):
     status, body = mcp_request(gateway_url, token, payload)
     body_str = json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else str(body)
     print(f"  DIRECT Gateway URL (token valido) -> HTTP {status} | body: {body_str[:300]}")
-    blocked = status == 403 or (isinstance(body, dict) and body.get("error", {}).get("code") == -32002)
     check(
         "[waf] Invocacion DIRECTA al Gateway BLOQUEADA por WAF (aunque el JWT sea valido)",
-        blocked,
+        is_blocked(status, body),
         f"(HTTP {status})",
     )
+
+    status, body = mcp_request(gateway_url, token, payload,
+                               extra_headers={"X-Origin-Verify": secrets.token_urlsafe(48)})
+    print(f"  DIRECT + header INCORRECTO (aleatorio) -> HTTP {status}")
+    check("[waf] Header X-Origin-Verify incorrecto -> BLOQUEADO", is_blocked(status, body), f"(HTTP {status})")
+
+    status, body = mcp_request(gateway_url, token, payload,
+                               extra_headers={"X-Origin-Verify": LEGACY_DEMO_SECRET})
+    print(f"  DIRECT + valor demo anterior ('{LEGACY_DEMO_SECRET}') -> HTTP {status}")
+    if accepts_previous_secret():
+        print("    (ventana de rotacion activa: origin_verify_accept_previous_secret=true, se omite el check)")
+    else:
+        check("[waf] Valor demo anterior ya NO es aceptado -> BLOQUEADO", is_blocked(status, body),
+              f"(HTTP {status})")
+
+    if previous_secret and previous_secret != origin_secret and not accepts_previous_secret():
+        status, body = mcp_request(gateway_url, token, payload,
+                                   extra_headers={"X-Origin-Verify": previous_secret})
+        print(f"  DIRECT + secreto ROTADO (AWSPREVIOUS, no se imprime) -> HTTP {status}")
+        check("[waf] Secreto rotado (AWSPREVIOUS) ya NO es aceptado -> BLOQUEADO", is_blocked(status, body),
+              f"(HTTP {status})")
+
+    if origin_secret:
+        status, body = mcp_request(gateway_url, token, payload,
+                                   extra_headers={"X-Origin-Verify": origin_secret})
+        tools = extract_tool_names(body) if isinstance(body, dict) else []
+        print(f"  DIRECT + header CORRECTO (leido de Secrets Manager, no se imprime) -> HTTP {status} | tools: {tools}")
+        check(
+            "[waf] WAF calcula SHA256(header) y PERMITE el valor correcto",
+            status == 200 and len(tools) > 0,
+            f"(HTTP {status}, {len(tools)} tools)",
+        )
 
     status, body = mcp_request(domain_url, token, payload)
     tools = extract_tool_names(body) if isinstance(body, dict) else []
@@ -276,10 +405,19 @@ def main():
         test_error_handling(url)
 
     if not args.skip_waf_test:
+        origin_secret = previous_secret = None
+        if outputs.get("OriginVerifySecretName") and outputs.get("WafWebAclArn"):
+            origin_secret = get_origin_secret(outputs["OriginVerifySecretName"])
+            previous_secret = get_origin_secret(outputs["OriginVerifySecretName"], "AWSPREVIOUS")
+            test_waf_sha256_config(outputs["WafWebAclArn"], origin_secret)
+        else:
+            print("WARNING: WafWebAclArn/OriginVerifySecretName outputs missing -> skipping SHA-256 config tests")
         test_waf_origin_cloaking(
             gateway_url=outputs["GatewayUrl"],
             domain_url=outputs["CustomDomainMcpUrl"],
             token=tokens["santi"],
+            origin_secret=origin_secret,
+            previous_secret=previous_secret,
         )
 
     print(f"\n\n{'=' * 70}")
