@@ -6,7 +6,7 @@ Replica **end-to-end** del escenario del cliente **"santi-bank"** para validar *
 - **Amazon DynamoDB** como *data store* dinámico de permisos (usuario → tool → allowed).
 - **Amazon Cognito (JWT)** como *Inbound Auth* (CUSTOM_JWT authorizer).
 - **Custom Domain** con Route53 + ACM + CloudFront.
-- **Origin Cloaking** 🧱: **AWS WAF asociado directamente al Gateway** + secreto en **Secrets Manager** inyectado por CloudFront como header — el Gateway SOLO acepta tráfico que venga de CloudFront.
+- **Origin Cloaking** 🧱: **AWS WAF asociado directamente al Gateway** + secreto aleatorio en **Secrets Manager** inyectado por CloudFront como header. El Gateway SOLO acepta tráfico que venga de CloudFront, y el WAF **solo guarda el SHA-256 del secreto** (text transformation `SHA256`), nunca el valor en claro.
 - **100% Infraestructura como Código** con **AWS CDK (Python)** + Poetry.
 
 > Basado en la documentación oficial de AWS Labs:
@@ -26,7 +26,7 @@ Replica **end-to-end** del escenario del cliente **"santi-bank"** para validar *
 8. [Despliegue paso a paso](#8-despliegue-paso-a-paso)
 9. [Cómo probarlo con MCP-Inspector](#9-cómo-probarlo-con-mcp-inspector)
 10. [Cómo probarlo con Postman](#10-cómo-probarlo-con-postman)
-11. [Cómo probarlo con curl / script E2E](#11-cómo-probarlo-con-curl--script-e2e)
+11. [Cómo probarlo con curl / script E2E / DEMO interactiva ⭐](#11-cómo-probarlo-con-curl--script-e2e)
 12. [DEMOs guiadas con resultados esperados](#12-demos-guiadas-con-resultados-esperados)
 13. [Resultados de la validación E2E](#13-resultados-de-la-validación-e2e-2026-07-26-)
 14. [Estructura del proyecto](#14-estructura-del-proyecto)
@@ -44,7 +44,8 @@ El equipo del cliente tenía la validación AuthN/AuthZ **solo en el interceptor
 |---|---|---|---|
 | 1 | La validación debe ocurrir en **ListTools** (Interceptor RESPONSE) **Y** en **InvokeTool** (Interceptor REQUEST) | ✅ | Un solo Lambda FGAC conectado a los 2 puntos de intercepción. El REQUEST interceptor hace **short-circuit** de invocaciones no autorizadas (el target NUNCA se invoca) |
 | 2 | Los errores del Gateway son genéricos: "StatusCode ≠ 200 da SIEMPRE el mismo mensaje" (incluso con tokens vacíos) | ✅ | `ExceptionLevel: DEBUG` en el Gateway + patrón de DENY con **HTTP 200 + `isError: true`** para que el mensaje rico llegue al cliente MCP |
-| 3 | *(Follow-up)* ¿Es posible que el Gateway SOLO acepte peticiones desde CloudFront? | ✅ | **Origin cloaking**: WAF regional asociado DIRECTAMENTE al AgentCore Gateway (default BLOCK) + header secreto `X-Origin-Verify` (Secrets Manager) inyectado por CloudFront — ver [sección 7.3](#73--origin-cloaking-el-gateway-solo-acepta-tráfico-de-cloudfront-waf--secrets-manager) |
+| 3 | *(Follow-up)* ¿Es posible que el Gateway SOLO acepte peticiones desde CloudFront? | ✅ | **Origin cloaking**: WAF regional asociado DIRECTAMENTE al AgentCore Gateway (default BLOCK) + header secreto `X-Origin-Verify` (Secrets Manager) inyectado por CloudFront. Ver [sección 7.3](#73--origin-cloaking-el-gateway-solo-acepta-tráfico-de-cloudfront-waf--secrets-manager) |
+| 4 | *(Follow-up Ciber, 2026-11-19)* "En el WAF se ve el valor del header en claro, así no se permite activar el Gateway" | ✅ | La regla del WAF ahora compara `SHA256(header)` contra un **digest**: el WAF (consola, API, CloudTrail) solo expone un hash, el secreto es aleatorio de 64 caracteres y el header sale **REDACTED** en logs y sampled requests. Ver [sección 7.3.1](#731--sha-256-el-waf-ya-no-guarda-el-secreto-en-claro) |
 
 **¿Y la validación de headers custom?** ❌ **NO**. Headers como `X-Client-ID` son fácilmente falsificables. El ÚNICO origen de identidad confiable es el **JWT firmado**, cuya firma valida el Gateway (Inbound Auth) ANTES de invocar cualquier interceptor. El interceptor recibe el header `Authorization` gracias a `passRequestHeaders: true` y solo decodifica el payload (la firma ya está garantizada).
 
@@ -55,6 +56,8 @@ El equipo del cliente tenía la validación AuthN/AuthZ **solo en el interceptor
 > 📐 Diagrama Draw.io (iconos AWS oficiales) del flujo E2E: [`assets/santi-bank-fgac-e2e.drawio`](./assets/santi-bank-fgac-e2e.drawio) · PNG DPI-400: [`assets/santi-bank-fgac-e2e.png`](./assets/santi-bank-fgac-e2e.png)
 
 ![santi-bank FGAC + Origin Cloaking - Flujo E2E AWS](./assets/santi-bank-fgac-e2e.png)
+
+> 🔐 El detalle del origin cloaking con SHA-256 (cómo llega el digest al WAF en deploy time, cómo se valida cada request y cómo se rota) está en su propio diagrama: [`assets/santi-bank-origin-verify-sha256.png`](./assets/santi-bank-origin-verify-sha256.png). Ver [sección 7.3](#73--origin-cloaking-el-gateway-solo-acepta-tráfico-de-cloudfront-waf--secrets-manager).
 
 ```mermaid
 flowchart TB
@@ -73,10 +76,11 @@ flowchart TB
         COG["Cognito User Pool<br/>santi-bank-user-pool-dev<br/>SIN auto-registro<br/>App Client con USER_PASSWORD_AUTH"]
     end
 
-    SM["🔑 Secrets Manager<br/>santi-bank-origin-verify-dev<br/>valor: santi-aws"]
+    SM["🔑 Secrets Manager<br/>santi-bank-origin-verify-dev<br/>valor aleatorio 64 chars (rotable)"]
+    HASHCR["⚙️ Custom Resource<br/>santi-bank-origin-verify-hash-dev<br/>SHA-256 del secreto + VersionId"]
 
     subgraph GW["⚡ AgentCore Gateway MCP :: santi-bank-gateway-dev"]
-        WAF["🧱 AWS WAF regional - asociado al Gateway<br/>default: BLOCK 403<br/>ALLOW solo si header<br/>x-origin-verify == secreto"]
+        WAF["🧱 AWS WAF regional - asociado al Gateway<br/>default: BLOCK 403<br/>ALLOW solo si<br/>SHA256(x-origin-verify) == digest<br/>data protection: header REDACTED"]
         JWT["CUSTOM_JWT Authorizer<br/>valida firma + allowedClients<br/>ExceptionLevel: DEBUG"]
         REQINT["🛡️ REQUEST Interceptor - Lambda FGAC<br/>Bloquea tools/call NO permitidos<br/>short-circuit con mensaje claro"]
         RESINT["🛡️ RESPONSE Interceptor - Lambda FGAC<br/>Filtra tools/list por usuario"]
@@ -102,9 +106,10 @@ flowchart TB
     CLIENT -->|"HTTPS + Bearer JWT"| R53 --> CF -->|"origen HTTPS +<br/>header X-Origin-Verify"| WAF
     WAF -->|"✅ header valido"| JWT
     CLIENT -.->|"🚫 invocacion DIRECTA al Gateway URL<br/>SIN header X-Origin-Verify -> BLOCK 403"| WAF
-    SM -.->|"secreto como<br/>origin custom header"| CF
-    SM -.->|"secreto como<br/>search string de la regla"| WAF
-    CLIENT -.->|"1. token via USER_PASSWORD_AUTH"| COG
+    SM -.->|"secreto (version fijada)<br/>como origin custom header"| CF
+    SM -.->|"lee el secreto<br/>en deploy time"| HASHCR
+    HASHCR -.->|"SOLO el digest SHA-256<br/>como search string"| WAF
+    CLIENT -.->|"Paso 1: token via USER_PASSWORD_AUTH"| COG
     JWT -->|"discovery URL / validación firma"| COG
     JWT --> REQINT
     REQINT -->|"tools/call PERMITIDO"| TOOLS
@@ -247,8 +252,9 @@ sequenceDiagram
 | DynamoDB 1 | `santi-bank-fine-grained-access-mapping` | Matriz de permisos (FGAC) |
 | DynamoDB 2 | `santi-bank-users-data` | Datos bancarios de usuarios |
 | DynamoDB 3 | `santi-bank-channels-data` | Estado de canales |
-| WAF WebACL (regional) | `santi-bank-gateway-waf-dev` | Origin cloaking: asociado DIRECTAMENTE al Gateway |
-| Secrets Manager | `santi-bank-origin-verify-dev` | Secreto compartido CloudFront ↔ regla WAF (valor demo: `santi-aws`) |
+| Lambda Origin-Verify Hash | `santi-bank-origin-verify-hash-dev` | Custom Resources: (1) lee el secreto en deploy time y entrega SOLO su SHA-256 (actual + anterior) y el VersionId, rota el secreto si cambia `origin_verify_rotation_id`; (2) espera la propagación del WAF antes de que CloudFront cambie el header |
+| WAF WebACL (regional) | `santi-bank-gateway-waf-dev` | Origin cloaking: asociado DIRECTAMENTE al Gateway, regla `SHA256(header) == digest` + data protection del header |
+| Secrets Manager | `santi-bank-origin-verify-dev` | Secreto compartido CloudFront ↔ WAF: aleatorio de 64 caracteres generado por CloudFormation (el WAF solo ve su hash) |
 | CloudWatch Logs (WAF) | `aws-waf-logs-santi-bank-gateway-dev` | Logging de requests permitidos/bloqueados por WAF |
 
 ### Matriz de permisos (seed inicial)
@@ -396,44 +402,165 @@ exception_level=agentcore.GatewayExceptionLevel.DEBUG,
 
 ### 7.3 🎯 Origin Cloaking: el Gateway SOLO acepta tráfico de CloudFront (WAF + Secrets Manager)
 
-El endpoint del Gateway (`*.gateway.bedrock-agentcore.*.amazonaws.com`) es público por naturaleza. Para que **solo CloudFront pueda llegarle**, el stack implementa *origin cloaking* con [WAF asociado directamente al AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-waf.html):
+El endpoint del Gateway (`*.gateway.bedrock-agentcore.*.amazonaws.com`) es público por naturaleza. Para que **solo CloudFront pueda llegarle**, el stack implementa *origin cloaking* con [WAF asociado directamente al AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-waf.html). Desde 2026-11-19 la regla compara un **hash SHA-256**, así que el secreto ya no queda guardado en el WAF.
+
+> 📐 Diagrama dedicado del flujo SHA-256 (deploy time, runtime, qué ve cada quién y rotación): [`assets/santi-bank-origin-verify-sha256.drawio`](./assets/santi-bank-origin-verify-sha256.drawio) · PNG DPI-400: [`assets/santi-bank-origin-verify-sha256.png`](./assets/santi-bank-origin-verify-sha256.png)
+
+![santi-bank Origin Cloaking con SHA-256 - deploy time, runtime y rotación](./assets/santi-bank-origin-verify-sha256.png)
+
+**La idea en una frase:** CloudFront conoce el secreto y lo envía en cada request; el WAF solo conoce su huella (SHA-256), calcula el SHA-256 del header que recibe y compara huellas. Quien lea la configuración del WAF solo ve un hash irreversible.
+
+**Fase 1: deploy time (en cada `cdk deploy` que cambie el secreto o la regla)**
+
+| # | Quién | Qué hace |
+|---|---|---|
+| 1 | CloudFormation | Genera el secreto aleatorio de 64 caracteres en Secrets Manager (`GenerateSecretString`). El valor nunca pasa por el código ni por el template |
+| 2 | Lambda `santi-bank-origin-verify-hash-dev` (Custom Resource) | Lee el secreto (`GetSecretValue` de `AWSCURRENT` y `AWSPREVIOUS`) y calcula `base64(SHA-256)`. Devuelve a CloudFormation **solo** los digests y el `VersionId` actual |
+| 3 | CloudFormation → WAF | Escribe el digest en la regla: `SearchStringBase64` + `TextTransformation: SHA256` + `EXACTLY`, y activa la data protection del header |
+| 4 | Lambda `WafPropagationWait` (Custom Resource) | Espera 60 s para que todos los hosts del WAF tengan la regla nueva antes de tocar CloudFront |
+| 5 | CloudFormation → CloudFront | Resuelve `{{resolve:secretsmanager:<arn>:SecretString:::<VersionId>}}` y pone el valor real en el origin header `X-Origin-Verify` |
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant A as Atacante / cliente directo
+    participant CFN as CloudFormation
+    participant SM as Secrets Manager
+    participant CR as Lambda origin-verify-hash
+    participant W as WAF WebACL
+    participant WT as Lambda WafPropagationWait
+    participant CF as CloudFront
+
+    CFN->>SM: GenerateSecretString (64 chars aleatorios)
+    CFN->>CR: Create o Update (SecretArn, RotationId)
+    CR->>SM: GetSecretValue AWSCURRENT y AWSPREVIOUS
+    CR-->>CFN: SOLO digests base64(SHA-256) + VersionId
+    CFN->>W: UpdateWebACL con SearchStringBase64 = digest y SHA256
+    CFN->>WT: Create o Update (cambiaron los digests)
+    WT->>WT: espera 60 s (propagación del WAF)
+    CFN->>CF: UpdateDistribution con X-Origin-Verify = secreto (VersionId fijo)
+```
+
+**Fase 2: runtime (cada request MCP)**
+
+| # | Paso | Detalle |
+|---|---|---|
+| A | Cliente → Route 53 → CloudFront | HTTPS + `Authorization: Bearer <JWT de Cognito>`. El cliente **no conoce** el secreto |
+| B | CloudFront → Gateway | Agrega `X-Origin-Verify: <secreto>` (si el cliente manda un header con ese nombre, CloudFront lo reemplaza) |
+| C | WAF del Gateway | Calcula `SHA256(header)` y lo compara con el digest guardado. Coincide → ALLOW. No coincide o no viene → `403` con JSON-RPC `-32002`, **antes** del JWT |
+| D | AgentCore Gateway | Valida el JWT (`CUSTOM_JWT`) y llama al interceptor FGAC |
+| E | Interceptor FGAC | Filtra `tools/list` y bloquea los `tools/call` no permitidos. Loguea el evento con `x-origin-verify` = `***REDACTED***` |
+
+```mermaid
+sequenceDiagram
+    autonumber
     participant C as Cliente legitimo (custom domain)
     participant CF as CloudFront
     participant W as WAF regional (en el Gateway)
     participant GW as AgentCore Gateway
+    participant I as Interceptor FGAC
+    participant A as Llamada directa al Gateway URL
 
-    C->>CF: POST /mcp + Bearer JWT
-    CF->>W: Forward + header X-Origin-Verify: <secreto>
-    W->>W: Regla: header == secreto? ✅
-    W->>GW: ALLOW -> JWT auth -> interceptores -> tools
-    GW-->>C: HTTP 200 (flujo normal)
+    C->>CF: POST /mcp + Bearer JWT (sin secreto)
+    CF->>W: Forward + X-Origin-Verify con el secreto
+    W->>W: SHA256(header) == digest guardado? ✅
+    W->>GW: ALLOW
+    GW->>I: JWT valido, interceptor REQUEST o RESPONSE
+    I->>I: log del evento con x-origin-verify = ***REDACTED***
+    GW-->>C: HTTP 200 (tools filtradas por FGAC)
 
-    A->>W: POST directo al Gateway URL + Bearer JWT VALIDO
-    W->>W: Sin header X-Origin-Verify ❌
-    W-->>A: 🚫 BLOCK (403 / JSON-RPC -32002)<br/>aunque el token sea valido
+    A->>W: POST directo + JWT valido (sin header, header falso o secreto viejo)
+    W->>W: SHA256(header) != digest ❌
+    W-->>A: 🚫 403 / JSON-RPC -32002 (antes del JWT)
 ```
 
 | Componente | Configuración |
 |---|---|
-| **Secreto compartido** | Secrets Manager `santi-bank-origin-verify-dev` (valor demo: `santi-aws`). Referenciado vía *dynamic reference* de CloudFormation — no viaja hardcodeado entre recursos |
-| **CloudFront** | Origin custom header `X-Origin-Verify: <secreto>` inyectado hacia el Gateway |
-| **WAF WebACL regional** | Default action **BLOCK (403)**. Única regla ALLOW: `single_header x-origin-verify EXACTLY == secreto`. Asociado al Gateway con `wafv2 associate-web-acl` (custom resource) |
+| **Secreto compartido** | Secrets Manager `santi-bank-origin-verify-dev`: valor **aleatorio de 64 caracteres** generado por CloudFormation (`GenerateSecretString`). No existe en el código ni en el template |
+| **Digest (Custom Resource)** | Lambda `santi-bank-origin-verify-hash-dev`: en deploy time lee el secreto y devuelve SOLO `base64(SHA-256)` del valor actual y del anterior + el `VersionId` actual. Nunca loguea ni devuelve el secreto |
+| **CloudFront** | Origin custom header `X-Origin-Verify: <secreto>` vía *dynamic reference* **fijada al `VersionId`** del digest: si el secreto rota, CloudFront se actualiza en el mismo deploy |
+| **WAF WebACL regional** | Default action **BLOCK (403)**. Única regla ALLOW: `single_header x-origin-verify`, text transformation **`SHA256`**, `EXACTLY == digest` (`SearchStringBase64`). Asociado al Gateway con `wafv2 associate-web-acl` (custom resource) |
+| **Data protection** | `DataProtectionConfig` del WebACL: `SINGLE_HEADER x-origin-verify` con acción `SUBSTITUTION` (sale `REDACTED` en logs Y sampled requests; el `RedactedFields` del logging no cubre sampled requests) |
 | **Failure mode** | `FAIL_CLOSE` (default del Gateway: si WAF no responde, se bloquea) |
-| **Logging** | Log group `aws-waf-logs-santi-bank-gateway-dev` + métricas `WafBlocks` en `AWS/Bedrock-AgentCore` y métricas del WebACL |
+| **Logging** | Log group `aws-waf-logs-santi-bank-gateway-dev` + métricas `WafBlocks` en `AWS/Bedrock-AgentCore` y métricas del WebACL. El interceptor FGAC también redacta `x-origin-verify` antes de loguear el evento |
 
 **Resultado validado:**
 
-| Invocación | Header inyectado | Resultado |
+| Invocación (siempre con JWT válido) | Header `X-Origin-Verify` | Resultado |
 |---|---|---|
-| Directa al Gateway URL (JWT válido) | ❌ No | 🚫 **BLOQUEADA por WAF** |
-| Vía `santi-bank-fine-access.cb.events.genai.aws.dev` (JWT válido) | ✅ CloudFront lo inyecta | ✅ Flujo completo (JWT → interceptores → tools) |
+| Vía `santi-bank-fine-access.cb.events.genai.aws.dev` | ✅ CloudFront inyecta el secreto | ✅ `200`, flujo completo (JWT → interceptores → tools) |
+| Directa al Gateway URL | ❌ no viene | 🚫 **`403` / `-32002`** |
+| Directa, header aleatorio | ❌ el hash no coincide | 🚫 **`403`** |
+| Directa, `santi-aws` (valor demo viejo) | ❌ el hash no coincide | 🚫 **`403`** |
+| Directa, secreto rotado (`AWSPREVIOUS`) | ❌ ya no está en la regla | 🚫 **`403`** |
+| Directa con el secreto correcto (prueba de laboratorio de `validate_fgac.py`) | ✅ el hash coincide | ✅ `200`: prueba que el WAF calcula el SHA-256 del header |
 
-> ⚠️ Nota de seguridad: la allowlist de IPs de CloudFront NO basta por sí sola (esas IPs son compartidas por todas las distribuciones del mundo) — el header secreto es el control determinante. En producción: rotar el secreto (Secrets Manager rotation + actualización de CloudFront/WAF) y complementar con WAF managed rules + rate limiting en el CloudFront.
+> ⚠️ Nota de seguridad: la allowlist de IPs de CloudFront NO basta por sí sola (esas IPs son compartidas por todas las distribuciones del mundo), por eso el header secreto es el control determinante. Compleméntalo con WAF managed rules + rate limiting en el CloudFront. El control fuerte de identidad sigue siendo el JWT (Inbound Auth) + los interceptores.
+
+#### 7.3.1 🔐 SHA-256: el WAF ya no guarda el secreto en claro
+
+**Hallazgo de Ciber (2026-11-19):** con la regla original (`ByteMatch` + `NONE`), el valor exacto del header quedaba visible en la configuración del WAF (`GetWebACL`, consola, CloudTrail de `UpdateWebACL`) aunque el secreto viviera en Secrets Manager y se rotara. AWS WAF no se integra con Secrets Manager, así que la solución es **no guardar el secreto en el WAF**:
+
+1. AWS WAF soporta la [text transformation `SHA256`](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-transformation.html): calcula el SHA-256 del header recibido (salida binaria cruda) **antes** de comparar.
+2. La regla guarda solo `base64(SHA-256(secreto))` en `SearchStringBase64`, con `PositionalConstraint: EXACTLY`.
+3. Un hash SHA-256 no se puede revertir **si el secreto es aleatorio y largo**: por eso el valor demo `santi-aws` se reemplazó por 64 caracteres aleatorios (con un valor adivinable, el hash se rompe por diccionario offline). El custom resource falla el deploy si el secreto tiene menos de 32 caracteres.
+4. CloudFormation no puede calcular un SHA-256 de un *dynamic reference*: por eso existe el custom resource, que lee el secreto en deploy time y entrega solo el hash (nunca loguea ni devuelve el valor).
+
+Así queda el valor en cada lugar:
+
+| Dónde | Antes (`NONE`) | Ahora (`SHA256`) |
+|---|---|---|
+| Regla del WAF (consola, `GetWebACL`, CloudTrail `UpdateWebACL`) | 🔴 valor en claro | 🟢 solo el digest SHA-256 |
+| Template de CloudFormation / código CDK | 🔴 `santi-aws` en `SecretString` | 🟢 no existe (`GenerateSecretString`) |
+| Logs del WAF y sampled requests | 🔴 header en claro | 🟢 `REDACTED` (data protection) |
+| Logs del interceptor FGAC (`passRequestHeaders: true`) | 🔴 header en claro | 🟢 `***REDACTED***` |
+| Secrets Manager | 🟡 valor (cifrado con KMS, acceso por IAM) | 🟡 igual: es el vault |
+| CloudFront (origin custom header) | 🔴 valor en claro | 🔴 sigue en claro (ver 7.3.3) |
+
+Validarlo uno mismo (el digest es público por diseño, el secreto nunca se imprime):
+
+```bash
+# Lo que ve cualquiera con wafv2:GetWebACL: solo base64(SHA-256) + transformation SHA256
+aws wafv2 get-web-acl --scope REGIONAL --name santi-bank-gateway-waf-dev --id <id> \
+  --query "WebACL.Rules[0].Statement" --region us-east-1
+```
+
+#### 7.3.2 🔄 Rotación del secreto sin downtime
+
+Rotar = crear un nuevo valor en Secrets Manager, aceptar **ambos** digests en el WAF mientras CloudFront propaga y luego retirar el anterior:
+
+| Paso | `cdk.json` (`app_config.dev`) | Qué pasa |
+|---|---|---|
+| 1 | Subir `origin_verify_rotation_id` (ej. `v1` → `v2`) + `origin_verify_accept_previous_secret: true` → `cdk deploy` | El custom resource crea una versión nueva aleatoria (idempotente) → el WAF acepta digest nuevo **y** anterior (`OrStatement`) → espera de propagación del WAF (`origin_verify_waf_propagation_seconds`, 60 s) → CloudFront toma el nuevo `VersionId` |
+| 2 | `origin_verify_accept_previous_secret: false` → `cdk deploy` | El WAF acepta solo el digest actual: el valor anterior queda inválido |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as cdk deploy (CloudFormation)
+    participant CR as Lambda origin-verify-hash
+    participant SM as Secrets Manager
+    participant W as WAF
+    participant CF as CloudFront
+
+    Note over D,CF: Paso 1 (rotation_id v1 a v2, accept_previous = true)
+    D->>CR: Update porque cambio el RotationId
+    CR->>SM: PutSecretValue (nueva = AWSCURRENT, vieja = AWSPREVIOUS)
+    CR-->>D: digest nuevo + digest anterior + VersionId nuevo
+    D->>W: regla OR que acepta el digest nuevo Y el anterior
+    D->>D: WafPropagationWait 60 s
+    D->>CF: header con el VersionId nuevo (los edges viejos mandan el anterior y se acepta)
+    Note over D,CF: Paso 2 (accept_previous = false)
+    D->>W: regla que acepta solo el digest nuevo (el anterior ahora da 403)
+```
+
+> 🧪 **Aprendizaje real (2026-11-19):** en la primera migración, sin la espera, CloudFormation marcó el WebACL `UPDATE_COMPLETE` y 9 s después un edge de CloudFront ya enviaba el valor nuevo a un host del WAF que todavía tenía la regla vieja: **1 request con 403** de ~60 (medido con un monitor cada 3 s). Por eso existe `CustomResource-WafPropagationWait`: CloudFront depende de esa espera, no solo del WebACL.
+
+> 💡 Para el banco: si la rotación la hace una Lambda propia (Secrets Manager rotation), la lógica es la misma: escribir en el WAF `base64(SHA-256)` de `AWSCURRENT` y `AWSPENDING` durante la ventana, actualizar CloudFront y luego dejar solo el digest actual.
+
+#### 7.3.3 ⚠️ Límites conocidos y siguiente paso
+
+- **CloudFront sigue guardando el valor en claro** en el origin custom header (consola y `GetDistributionConfig`), igual que cualquier esquema de secreto compartido. Opciones para cerrarlo: inyectar el header con **Lambda@Edge (origin request)** leyendo Secrets Manager en runtime (el valor solo vive en el vault) o con CloudFront Functions + KeyValueStore (sale de la config de la distribución, con IAM propio).
+- **Arquitectura sin secreto**: VPC endpoint `com.amazonaws.<region>.bedrock-agentcore.gateway` + *resource-based policy* del Gateway que solo permite `bedrock-agentcore:InvokeGateway` con `aws:SourceVpce`, con CloudFront VPC origins al frente. Ahí no hay secreto que esconder ni rotar (pendiente POC del enrutamiento por hostname del Gateway).
 
 ---
 
@@ -491,7 +618,13 @@ El Custom Resource (`santi-bank-setup-users-dev`) corre en **CREATE y UPDATE** d
 | 3 | Puebla `santi-bank-channels-data` (SVP, SVN, App, Valores, SantiBot) |
 | 4 | Puebla `santi-bank-fine-grained-access-mapping` (matriz de permisos) |
 
-Adicionalmente, el segundo Custom Resource (`santi-bank-waf-association-dev`) asocia el WebACL de origin cloaking **directamente al AgentCore Gateway** (`wafv2 associate-web-acl`), con lógica de resiliencia (ver 8.5).
+Adicionalmente, el stack tiene otros Custom Resources para el origin cloaking:
+
+| Custom Resource | Lambda | Qué hace |
+|---|---|---|
+| `WAF-GatewayAssociation` | `santi-bank-waf-association-dev` | Asocia el WebACL **directamente al AgentCore Gateway** (`wafv2 associate-web-acl`), con lógica de resiliencia (ver 8.5) |
+| `CustomResource-OriginVerifyHash` | `santi-bank-origin-verify-hash-dev` | Lee el secreto y entrega SOLO su SHA-256 (actual + anterior) y el `VersionId`. Si cambia `origin_verify_rotation_id`, crea una versión nueva del secreto (ver 7.3.2) |
+| `CustomResource-WafPropagationWait` | `santi-bank-origin-verify-hash-dev` (modo espera) | Espera `origin_verify_waf_propagation_seconds` (60 s) entre el WebACL y CloudFront cuando cambian los digests |
 
 ### 8.4 Outputs del stack (valores reales del despliegue)
 
@@ -504,6 +637,7 @@ Adicionalmente, el segundo Custom Resource (`santi-bank-waf-association-dev`) as
 | `CloudFrontDomain` | `d4te0tuscgxgn.cloudfront.net` |
 | `WafWebAclArn` | ARN del WebACL `santi-bank-gateway-waf-dev` (asociado al Gateway) |
 | `OriginVerifySecretName` | `santi-bank-origin-verify-dev` (Secrets Manager) |
+| `OriginVerifySecretVersionId` | `VersionId` del secreto que usan CloudFront y el digest del WAF (cambia al rotar) |
 | `WafLogGroupName` | `aws-waf-logs-santi-bank-gateway-dev` |
 
 ### 8.5 🔧 Troubleshooting: asociación WAF ↔ AgentCore Gateway (aprendizajes reales)
@@ -517,6 +651,9 @@ Hallazgos empíricos de este despliegue (automatizados en `backend/lambdas/waf_a
 | 3 | `AccessDeniedException ... wafv2:GetWebACL` al verificar con `get-web-acl-for-resource` | Esa API requiere **`wafv2:GetWebACL`** además de `GetWebACLForResource` | Incluir ambos permisos en el rol del custom resource |
 | 4 | `AlreadyExists / duplicate` del WebACL en re-despliegues tras un rollback | Un WebACL **asociado** no puede borrarse en rollback → queda huérfano | Disociar (`disassociate-web-acl`) + borrar (`delete-web-acl` con lock token) antes de re-desplegar |
 | 5 | `AWS::WAFv2::WebACLAssociation` (CloudFormation) | No documenta soporte para ARNs `bedrock-agentcore` | Custom resource Lambda llamando `wafv2:AssociateWebACL` directamente |
+| 6 | `Value '...(SHA-256 match)' at 'description' failed to satisfy constraint: Member must satisfy regular expression pattern` | La `Description` del WebACL solo acepta `[\w+=:#@/\-,\.]` y espacios: **sin paréntesis** | Descripción sin paréntesis (el deploy hace rollback completo, sin impacto en el tráfico) |
+| 7 | 1 request con 403 justo al cambiar el header en CloudFront | `UPDATE_COMPLETE` del WebACL no significa que todos los hosts del WAF tengan la regla nueva | `Custom::WafPropagationWait` (60 s) entre el WebACL y CloudFront |
+| 8 | `WARNING ... 'SHA256' is not one of [...] (CloudFormation Validate)` en `cdk synth` | El schema de CloudFormation que trae esta versión de CDK es anterior a la transformation `SHA256` (la referencia oficial ya la lista) | Warning reconocido en el código (`CloudFormation-Validate::W3030`); el deploy funciona |
 
 ---
 
@@ -699,6 +836,51 @@ Misma URL/headers (token de **jimmy**). **Body:**
 
 ## 11. Cómo probarlo con curl / script E2E
 
+### 11.0 ⭐ Script DEMO interactivo paso a paso (ideal para clientes)
+
+`scripts/demo_fgac.py` es un **walkthrough guiado en vivo**: explica QUÉ pasa en cada paso, muestra los requests/responses reales (JSON-RPC) y te deja **usar las tools** desde un menú. Cero dependencias externas (stdlib + AWS CLI), mismo enfoque que `validate_fgac.py`.
+
+```bash
+python3 scripts/demo_fgac.py                       # interactivo: pide el usuario, pausa entre pasos
+python3 scripts/demo_fgac.py --user jimmy          # usuario pre-seleccionado
+python3 scripts/demo_fgac.py --no-pause            # sin "ENTER para continuar" (demos rápidas / grabaciones)
+python3 scripts/demo_fgac.py --url-mode gateway    # URL directa del Gateway (el WAF la bloquea a propósito)
+python3 scripts/demo_fgac.py --no-color            # salida plana (para pipes / logs)
+```
+
+| Paso | Qué muestra | Concepto que se explica al cliente |
+|---|---|---|
+| **0** Discover | Outputs del stack (Gateway, CloudFront, Cognito, tablas) | Nada hardcodeado; todo sale de CloudFormation |
+| **1** Usuario | Matriz de permisos `santi` / `jimmy` / `joacho` (o un username custom) | DynamoDB como única fuente de verdad del FGAC |
+| **2** Auth | Comando `initiate-auth`, Access Token y **JWT decodificado** (header + claims) | El claim `username` es la identidad; la firma la valida el Gateway (JWKS) |
+| **3** MCP `initialize` | Handshake JSON-RPC y `serverInfo` del Gateway | Cómo un cliente MCP "se conecta" |
+| **4** MCP `tools/list` | Tools visibles (+ descripción y parámetros) y tools **ocultas** por el RESPONSE interceptor | Filtrado por usuario (Hipótesis 1A) |
+| **5** Menú | `[1..n]` ejecutar tool · `[F]` petición armada a tool oculta · `[L]` re-listar · `[D]` comandos grant/revoke DynamoDB · `[U]` cambiar usuario · `[E]` errores de token · `[W]` origin cloaking · `[R]` respuesta RAW | "La ves pero NO la ejecutas" (short-circuit), permisos dinámicos, Hipótesis 2, WAF |
+
+```mermaid
+flowchart TD
+    S0["STEP 0<br/>describe-stacks<br/>(outputs)"] --> S1["STEP 1<br/>Seleccionar usuario<br/>santi / jimmy / joacho"]
+    S1 --> S2["STEP 2<br/>Cognito initiate-auth<br/>+ decodificar JWT"]
+    S2 --> S3["STEP 3<br/>MCP initialize"]
+    S3 --> S4["STEP 4<br/>MCP tools/list<br/>(RESPONSE interceptor filtra)"]
+    S4 --> M{"STEP 5<br/>Menú interactivo"}
+    M -->|"[1..n]"| CALL["tools/call PERMITIDO<br/>REQUEST interceptor -> Lambda target"]
+    M -->|"[F]"| FORGED["tools/call a tool OCULTA<br/>short-circuit: isError=true"]
+    M -->|"[L]"| S4
+    M -->|"[D]"| DDB["Comandos update-item<br/>grant / revoke en DynamoDB"]
+    M -->|"[U]"| S1
+    M -->|"[E]"| ERR["Sin token / token inválido<br/>-> HTTP 401"]
+    M -->|"[W]"| WAF["Gateway directo -> 403 WAF<br/>CloudFront -> 200"]
+    CALL --> M
+    FORGED --> M
+    DDB --> M
+    ERR --> M
+    WAF --> M
+    M -->|"[Q]"| END(["Fin"])
+```
+
+> 💡 Flujo recomendado en una demo: entrar como `jimmy` → mostrar el JWT → `tools/list` (3 tools, canales oculta) → ejecutar `consulta_saldo` → `[F]` forzar `consulta_canales` (DENY con mensaje) → `[D]` otorgar canales en DynamoDB → `[L]` re-listar (aparecen 4 tools sin redeploy) → `[W]` origin cloaking.
+
 ### 11.1 Script E2E automatizado (el mismo que validó el despliegue)
 
 ```bash
@@ -785,12 +967,20 @@ aws dynamodb update-item --region us-east-1 \
 | Paso | Acción | Resultado esperado |
 |---|---|---|
 | 1 | Obtener token válido de `santi` | Token OK |
-| 2 | `POST` DIRECTO al Gateway URL (`*.gateway.bedrock-agentcore...amazonaws.com/mcp`) con ese token | 🚫 `HTTP 403` + `{"error":{"code":-32002,"message":"Forbidden - Request blocked by AWS WAF"}}` — bloqueado ANTES del JWT authorizer |
-| 3 | Misma petición vía `https://santi-bank-fine-access.cb.events.genai.aws.dev/mcp` | ✅ `HTTP 200` + tools (CloudFront inyectó `X-Origin-Verify`) |
-| 4 | Revisar el log del WAF | Entradas `ALLOW` (con header, regla `AllowOnlyCloudFrontWithOriginVerifyHeader`) y `BLOCK` (sin header) |
+| 2 | `POST` DIRECTO al Gateway URL (`*.gateway.bedrock-agentcore...amazonaws.com/mcp`) con ese token | 🚫 `HTTP 403` + `{"error":{"code":-32002,"message":"Forbidden - Request blocked by AWS WAF"}}`, bloqueado ANTES del JWT authorizer |
+| 3 | Mismo `POST` directo pero con `-H "X-Origin-Verify: santi-aws"` (o cualquier valor inventado) | 🚫 `HTTP 403`: el SHA-256 de ese valor no coincide con el digest |
+| 4 | Misma petición vía `https://santi-bank-fine-access.cb.events.genai.aws.dev/mcp` | ✅ `HTTP 200` + tools (CloudFront inyectó `X-Origin-Verify`) |
+| 5 | Mostrar la regla del WAF (lo que ve Ciber) | Solo `SearchString` = base64(SHA-256) + `TextTransformations: SHA256`, nunca el secreto |
+| 6 | Revisar el log del WAF | Entradas `ALLOW` (regla `AllowOnlyCloudFrontWithOriginVerifyHeader`) y `BLOCK` (sin header o hash distinto), con `x-origin-verify` = `REDACTED` |
 
 ```bash
-# Ver decisiones del WAF en tiempo real:
+# Paso 5: la regla del WAF solo expone el digest
+WAF_ID=$(aws wafv2 list-web-acls --scope REGIONAL --region us-east-1 \
+  --query "WebACLs[?Name=='santi-bank-gateway-waf-dev'].Id" --output text)
+aws wafv2 get-web-acl --scope REGIONAL --region us-east-1 --name santi-bank-gateway-waf-dev --id "$WAF_ID" \
+  --query "WebACL.Rules[0].Statement.ByteMatchStatement.{SearchString:SearchString,Transform:TextTransformations[0].Type}"
+
+# Paso 6: ver decisiones del WAF en tiempo real (el header sale REDACTED)
 aws logs tail aws-waf-logs-santi-bank-gateway-dev --region us-east-1 --follow
 ```
 
@@ -816,6 +1006,28 @@ Ejemplo real del log del interceptor durante un DENY:
 ---
 
 ## 13. Resultados de la validación E2E (2026-07-26) ✅
+
+### 13.1 🔐 Validación del WAF con SHA-256 (2026-11-19)
+
+Despliegue en 3 pasos sobre el stack vivo (migración a secreto aleatorio, rotación `v2`, cierre de la ventana de rotación) con un monitor llamando `tools/list` por el custom domain cada ~3.5 s:
+
+| Validación | Resultado |
+|---|:---:|
+| `scripts/validate_fgac.py` (FGAC + errores + 5 checks de config SHA-256 + 6 checks de origin cloaking) | ✅ **21/21 PASS** |
+| `GetWebACL`: la regla solo muestra `SearchString` = base64(SHA-256) + transformation `SHA256`; el secreto no aparece ni plano ni en base64 | ✅ |
+| Directo al Gateway: sin header / header aleatorio / `santi-aws` / secreto rotado (`AWSPREVIOUS`) → `403 -32002` | ✅ |
+| Directo al Gateway con el header correcto → `200` + 4 tools (el WAF calcula `SHA256(header)` y compara) | ✅ |
+| Custom domain (CloudFront) → `200` + tools en los 3 pasos | ✅ |
+| Monitor, migración inicial SIN espera de propagación | ⚠️ 61 muestras, **1 × 403** (ver 7.3.2) |
+| Monitor, rotación `v2` CON `WafPropagationWait` (60 s) | ✅ **66/66 HTTP 200** |
+| Monitor, paso 2 (`origin_verify_accept_previous_secret: false`) | ✅ **31/31 HTTP 200** |
+| Logs del WAF (8 min, 164 registros): `x-origin-verify` = `REDACTED` en 162/162 | ✅ |
+| Logs del interceptor: 316 ocurrencias `***REDACTED***`, ningún secreto en claro | ✅ |
+| `cdk diff` después del despliegue → `There were no differences` | ✅ |
+
+> 📝 Nota honesta: el único 403 de la migración inicial lo evaluó un host del WAF con la configuración vieja (sin data protection), así que esa línea de log contiene el valor de ese momento en claro. Ese valor se rotó (`v2`) y hoy el WAF lo rechaza (check "secreto rotado → BLOQUEADO"). Desde la configuración nueva, todos los logs salen redactados.
+
+### 13.2 Validación original (2026-07-26)
 
 Validación inicial (pre-WAF) contra Gateway URL directo + custom domain: **20/20 PASS**. Validación final (con **origin cloaking** activo, vía custom domain + test WAF): **12/12 PASS** con el script + **47/47 assertions** con Postman/newman.
 
@@ -843,16 +1055,20 @@ Validación inicial (pre-WAF) contra Gateway URL directo + custom domain: **20/2
 ├── README.md                          # Este documento
 ├── LICENSE                            # Apache License 2.0
 ├── .gitignore
+├── assets/
+│   ├── santi-bank-fgac-e2e.drawio / .png              # Arquitectura E2E (FGAC + origin cloaking SHA-256)
+│   └── santi-bank-origin-verify-sha256.drawio / .png  # 🔐 Flujo SHA-256: deploy time, runtime, visibilidad y rotación
 ├── backend/lambdas/
 │   ├── consulta_saldo/handler.py          # Tool: saldo de un usuario (users-data)
 │   ├── consulta_tarjetas/handler.py       # Tool: tarjetas de un usuario (users-data)
 │   ├── consulta_canales/handler.py        # Tool: estado de TODOS los canales (channels-data)
 │   ├── consulta_preferencias/handler.py   # Tool: preferencias app de un usuario (users-data)
-│   ├── fgac_interceptor/handler.py        # 🛡️ Interceptor FGAC (REQUEST + RESPONSE)
+│   ├── fgac_interceptor/handler.py        # 🛡️ Interceptor FGAC (REQUEST + RESPONSE, redacta x-origin-verify en logs)
+│   ├── origin_verify_hash/handler.py      # 🔐 Custom Resource: SHA-256 del secreto para el WAF (+ rotación)
 │   ├── setup_custom_resource/handler.py   # Custom Resource: users Cognito + seed DynamoDB
 │   └── waf_association/handler.py         # 🧱 Custom Resource: WAF <-> Gateway (retries + refresh)
 ├── infrastructure/
-│   ├── cdk.json                       # app_config (dev): nombres, dominio, deny mode
+│   ├── cdk.json                       # app_config (dev): nombres, dominio, deny mode, rotación origin-verify
 │   ├── pyproject.toml                 # Poetry (.venv en el root del proyecto CDK)
 │   ├── Makefile                       # install / synth / diff / deploy / destroy
 │   ├── .gitignore
@@ -863,7 +1079,8 @@ Validación inicial (pre-WAF) contra Gateway URL directo + custom domain: **20/2
 ├── postman/
 │   └── santi-bank-fgac.postman_collection.json  # Colección Postman (auto-auth + 47 tests, incl. WAF)
 └── scripts/
-    └── validate_fgac.py               # Validación E2E (20 checks, stdlib + AWS CLI)
+    ├── demo_fgac.py                   # ⭐ DEMO interactiva paso a paso para clientes (auth -> MCP -> tools)
+    └── validate_fgac.py               # Validación E2E (21 checks incl. WAF SHA-256, stdlib + AWS CLI)
 ```
 
 ---
@@ -888,6 +1105,10 @@ poetry run cdk destroy --all --force
 | Docs: Gateway Interceptors (tipos y contratos) | [docs.aws.amazon.com/bedrock-agentcore/.../gateway-interceptors-types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html) |
 | Docs: Configuración de interceptores (`passRequestHeaders`) | [docs.aws.amazon.com/bedrock-agentcore/.../gateway-interceptors-configuration](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-configuration.html) |
 | Docs: Protecting your gateway with AWS WAF (asociación, failure modes, métricas) | [docs.aws.amazon.com/bedrock-agentcore/.../gateway-waf](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-waf.html) |
+| Docs: AWS WAF text transformations (`SHA256`, `MD5`) | [docs.aws.amazon.com/waf/.../waf-rule-statement-transformation](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-transformation.html) |
+| Docs: AWS WAF data protection (`SUBSTITUTION` / `HASH` en logs y sampled requests) | [docs.aws.amazon.com/waf/.../API_DataProtection](https://docs.aws.amazon.com/waf/latest/APIReference/API_DataProtection.html) |
+| Docs: CloudFormation dynamic references a Secrets Manager (`version-id`) | [docs.aws.amazon.com/AWSCloudFormation/.../dynamic-references-secretsmanager](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html) |
+| Docs: Resource-based policies para AgentCore (Gateway + `aws:SourceVpce`) | [docs.aws.amazon.com/bedrock-agentcore/.../resource-based-policies](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/resource-based-policies.html) |
 | Docs: PrivateLink / VPC endpoints para AgentCore (incl. endpoint dedicado de Gateway) | [docs.aws.amazon.com/bedrock-agentcore/.../vpc-interface-endpoints](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc-interface-endpoints.html) |
 | Blog: Limit access to your origins using the AWS-managed prefix list for CloudFront | [aws.amazon.com/blogs/networking-and-content-delivery/...](https://aws.amazon.com/blogs/networking-and-content-delivery/limit-access-to-your-origins-using-the-aws-managed-prefix-list-for-amazon-cloudfront/) |
 | CDK L2: `aws_bedrockagentcore` (Gateway, LambdaInterceptor, Targets) | [docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_bedrockagentcore-readme](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_bedrockagentcore-readme.html) |

@@ -19,7 +19,10 @@
         "custom_domain_subdomain": "santi-bank-fine-access",
         "cognito_users": ["santi", "jimmy", "joacho"],
         "gateway_exception_level": "DEBUG",
-        "interceptor_deny_mode": "mcp_error"
+        "interceptor_deny_mode": "mcp_error",
+        "origin_verify_rotation_id": "v2",
+        "origin_verify_accept_previous_secret": false,
+        "origin_verify_waf_propagation_seconds": 60
       }
     }
   }
